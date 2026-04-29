@@ -30,7 +30,7 @@ defmodule Elv.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/TomLo-FStack/elixir-luv-v"},
-      files: ~w(lib mix.exs README.md LICENSE CHANGELOG.md)
+      files: ~w(lib mix.exs README.md ARCHITECTURE.md LICENSE CHANGELOG.md)
     ]
   end
 end

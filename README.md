@@ -114,6 +114,12 @@ elv v path               # print the active V executable
 
 V is a compiled language, not a dynamic interpreter. ELV keeps a session model in Elixir, renders it into a temporary V program, runs `v run`, and prints only the new output suffix. Deterministic snippets feel stateful; code with side effects may run again when the session is replayed.
 
+## North Star
+
+ELV's long-term direction is a supervised hot-reload sandbox: Elixir owns the session, supervision, LSP integration, diagnostics, build cache, and crash recovery; V owns fast native compilation and execution.
+
+The current release is the portable baseline. The planned architecture is documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Bundled V Policy
 
 The default release is **ELV Slim** and does not include V.

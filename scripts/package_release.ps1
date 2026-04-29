@@ -38,6 +38,7 @@ Copy-Item -LiteralPath (Join-Path $root "elv") -Destination (Join-Path $pkgDir "
 Copy-Item -LiteralPath (Join-Path $root "bin/elv") -Destination (Join-Path $pkgDir "bin/elv")
 Copy-Item -LiteralPath (Join-Path $root "bin/elv.cmd") -Destination (Join-Path $pkgDir "bin/elv.cmd")
 Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination $pkgDir
+Copy-Item -LiteralPath (Join-Path $root "ARCHITECTURE.md") -Destination $pkgDir
 Copy-Item -LiteralPath (Join-Path $root "LICENSE") -Destination $pkgDir
 Copy-Item -LiteralPath (Join-Path $root "CHANGELOG.md") -Destination $pkgDir
 
