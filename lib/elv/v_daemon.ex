@@ -47,6 +47,18 @@ defmodule Elv.VDaemon do
     GenServer.call(pid, {:unload_generation, generation, opts}, :infinity)
   end
 
+  def eval(pid, source, opts \\ []) when is_binary(source) do
+    GenServer.call(pid, {:eval, source, opts}, :infinity)
+  end
+
+  def reset(pid, opts \\ []) do
+    GenServer.call(pid, {:reset, opts}, :infinity)
+  end
+
+  def snapshot(pid, opts \\ []) do
+    GenServer.call(pid, {:snapshot, opts}, :infinity)
+  end
+
   def recycle(pid, reason, opts \\ []) do
     GenServer.call(pid, {:recycle, reason, opts}, :infinity)
   end
@@ -151,6 +163,36 @@ defmodule Elv.VDaemon do
 
       :error ->
         {:reply, {:ok, %{generation: generation, unloaded?: false, reason: :not_loaded}}, state}
+    end
+  end
+
+  def handle_call({:eval, source, opts}, _from, state) do
+    case state.driver.eval(state.driver_state, source, opts) do
+      {:ok, result, driver_state} ->
+        {:reply, {:ok, result}, %{state | driver_state: driver_state, last_error: nil}}
+
+      {:error, message, driver_state} ->
+        {:reply, {:error, message}, %{state | driver_state: driver_state, last_error: message}}
+    end
+  end
+
+  def handle_call({:reset, opts}, _from, state) do
+    case state.driver.reset(state.driver_state, opts) do
+      {:ok, result, driver_state} ->
+        {:reply, {:ok, result}, %{state | driver_state: driver_state, last_error: nil}}
+
+      {:error, message, driver_state} ->
+        {:reply, {:error, message}, %{state | driver_state: driver_state, last_error: message}}
+    end
+  end
+
+  def handle_call({:snapshot, opts}, _from, state) do
+    case state.driver.snapshot(state.driver_state, opts) do
+      {:ok, result, driver_state} ->
+        {:reply, {:ok, result}, %{state | driver_state: driver_state, last_error: nil}}
+
+      {:error, message, driver_state} ->
+        {:reply, {:error, message}, %{state | driver_state: driver_state, last_error: message}}
     end
   end
 

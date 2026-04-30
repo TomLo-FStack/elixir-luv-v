@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 - 2026-05-01
+
+- Added `elv repl --backend daemon` for authoritative source-level execution through a long-running V daemon, with replay degradation diagnostics.
+- Added front fast-path freezing diagnostics so `:doctor` shows `front_fast`, frozen reason, pending sync count, and native fallback count.
+- Kept the Engine-internal fast evaluator synchronized with authoritative session state while freezing only the speculative CLI front path after native fallback.
+- Added semicolon sequence handling for forms like `mut counter := 1; counter += 2; counter` across replay, hot-load rendering, and daemon execution.
+- Added replay fallback synchronization after daemon eval failure so successful daemon history is replayed before fallback continues.
+- Added replay-vs-daemon fallback benchmarking with median/p95 output and V compile-bound labeling.
+
 ## 0.2.0 - 2026-04-30
 
 - Started the v0.2 runtime foundation: ELV now boots as an OTP application with a dynamic session supervisor.

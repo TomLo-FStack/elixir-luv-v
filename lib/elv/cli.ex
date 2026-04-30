@@ -109,6 +109,7 @@ defmodule Elv.CLI do
       v_path: config.v.path,
       cwd: config.cwd,
       backend: config.backend,
+      daemon_fallback_backend: Elv.Engine,
       hot_reload_mode: hot_reload_mode(config.backend_name),
       tmp_root: config.tmp_root,
       snapshot_root: config.snapshot_root,
@@ -125,7 +126,7 @@ defmodule Elv.CLI do
         case EditorServer.start_link() do
           {:ok, editor} ->
             unless config.no_banner?, do: print_banner(session, config)
-            loop(session, editor, config)
+            loop(session, editor, config, new_front_eval(config))
 
           {:error, reason} ->
             SessionServer.close(session)
@@ -137,20 +138,23 @@ defmodule Elv.CLI do
     end
   end
 
-  defp loop(session, editor, config) do
+  defp loop(session, editor, config, front_eval) do
     case read_form(editor) do
       :eof ->
+        {session, _front_eval} = sync_front_eval(session, front_eval, config)
         SessionServer.close(session)
         EditorServer.close(editor)
         IO.puts("")
 
       {:command, :quit} ->
+        {session, _front_eval} = sync_front_eval(session, front_eval, config)
         SessionServer.close(session)
         EditorServer.close(editor)
 
       {:command, command} ->
-        session = handle_command(command, session, editor, config)
-        loop(session, editor, config)
+        {session, front_eval} = sync_front_eval(session, front_eval, config)
+        {session, front_eval} = handle_command(command, session, editor, config, front_eval)
+        loop(session, editor, config, front_eval)
 
       {:code, code} ->
         timed? = String.starts_with?(String.trim_leading(code), "@time ")
@@ -160,8 +164,8 @@ defmodule Elv.CLI do
             do: String.trim_leading(code) |> String.replace_prefix("@time ", ""),
             else: code
 
-        session = eval_and_print(session, editor, config, code, timed?)
-        loop(session, editor, config)
+        {session, front_eval} = eval_and_print(session, editor, config, front_eval, code, timed?)
+        loop(session, editor, config, front_eval)
     end
   end
 
@@ -193,7 +197,55 @@ defmodule Elv.CLI do
 
   defp eval_and_print(session, editor, config, code, timed?) do
     EditorServer.record(editor, code)
+    eval_authoritative(session, config, code, timed?)
+  end
 
+  defp eval_and_print(session, editor, config, front_eval, code, timed?) do
+    EditorServer.record(editor, code)
+
+    if front_eval.enabled? do
+      case Elv.FastEval.eval(code, front_eval.fast_eval) do
+        {:ok, output, elapsed_us, fast_eval} ->
+          print_output(output)
+          if timed?, do: IO.puts(color(:light_black, "elapsed: #{format_time(elapsed_us)}"))
+
+          front_eval = %{
+            front_eval
+            | fast_eval: fast_eval,
+              pending_rev: [code | front_eval.pending_rev]
+          }
+
+          {session, front_eval}
+
+        :error ->
+          eval_after_front_miss(session, config, front_eval, code, timed?)
+      end
+    else
+      {session, front_eval} = sync_front_eval(session, front_eval, config)
+      before_fallbacks = session_fallback_count(session)
+      session = eval_authoritative(session, config, code, timed?)
+      fallback_delta = max(session_fallback_count(session) - before_fallbacks, 0)
+
+      {session,
+       freeze_front_eval(front_eval, front_eval.frozen_reason || "front fast path is frozen",
+         native_fallback_delta: fallback_delta
+       )}
+    end
+  end
+
+  defp eval_after_front_miss(session, config, front_eval, code, timed?) do
+    {session, front_eval} = sync_front_eval(session, front_eval, config)
+    before_fallbacks = session_fallback_count(session)
+    session = eval_authoritative(session, config, code, timed?)
+    fallback_delta = max(session_fallback_count(session) - before_fallbacks, 1)
+
+    {session,
+     freeze_front_eval(front_eval, "native fallback after front fast miss",
+       native_fallback_delta: fallback_delta
+     )}
+  end
+
+  defp eval_authoritative(session, config, code, timed?) do
     case SessionServer.eval(session, code, hard_timeout_ms: config.hard_timeout_ms) do
       {:ok, output, elapsed_us, session} ->
         print_output(output)
@@ -206,7 +258,84 @@ defmodule Elv.CLI do
     end
   end
 
-  defp handle_command({:colon, line}, session, editor, config) do
+  defp new_front_eval(config) do
+    base = %{
+      enabled?: true,
+      fast_eval: Elv.FastEval.new(),
+      pending_rev: [],
+      synced_count: 0,
+      native_fallback_count: 0,
+      frozen_reason: nil
+    }
+
+    if config.backend_name == "replay" do
+      base
+    else
+      freeze_front_eval(base, "backend #{config.backend_name} is authoritative native/hot path")
+    end
+  end
+
+  defp sync_front_eval(session, %{pending_rev: []} = front_eval, _config),
+    do: {session, front_eval}
+
+  defp sync_front_eval(session, front_eval, config) do
+    {session, synced_count, sync_error} =
+      front_eval.pending_rev
+      |> Enum.reverse()
+      |> Enum.reduce_while({session, 0, nil}, fn code, {current_session, count, _error} ->
+        case SessionServer.eval(current_session, code, hard_timeout_ms: config.hard_timeout_ms) do
+          {:ok, _output, _elapsed_us, session} ->
+            {:cont, {session, count + 1, nil}}
+
+          {:error, message, session} ->
+            IO.puts(:stderr, color(:red, "front fast eval sync failed: #{message}"))
+            {:halt, {session, count, message}}
+        end
+      end)
+
+    front_eval = %{
+      front_eval
+      | pending_rev: [],
+        synced_count: front_eval.synced_count + synced_count
+    }
+
+    if sync_error do
+      {session, freeze_front_eval(front_eval, "front fast eval sync failed")}
+    else
+      {session, front_eval}
+    end
+  end
+
+  defp freeze_front_eval(front_eval, reason, opts \\ []) do
+    %{
+      front_eval
+      | enabled?: false,
+        pending_rev: [],
+        frozen_reason: front_eval.frozen_reason || reason,
+        native_fallback_count:
+          front_eval.native_fallback_count + Keyword.get(opts, :native_fallback_delta, 0)
+    }
+  end
+
+  defp handle_command(command, session, editor, config, front_eval) do
+    front_eval = freeze_front_eval_for_command(command, front_eval)
+    session = dispatch_command(command, session, editor, config, front_eval)
+    {session, front_eval}
+  end
+
+  defp freeze_front_eval_for_command({:colon, line}, front_eval) do
+    [command | _rest] = String.split(String.trim_leading(line, ":"), ~r/\s+/, parts: 2)
+
+    if command in ["load", "run", "recover", "reset"] do
+      freeze_front_eval(front_eval, ":#{command} changed authoritative session policy")
+    else
+      front_eval
+    end
+  end
+
+  defp freeze_front_eval_for_command(_command, front_eval), do: front_eval
+
+  defp dispatch_command({:colon, line}, session, editor, config, front_eval) do
     [command | rest] = String.split(String.trim_leading(line, ":"), ~r/\s+/, parts: 2)
     arg = rest |> List.first() |> Kernel.||("") |> String.trim()
 
@@ -224,7 +353,7 @@ defmodule Elv.CLI do
         session
 
       "doctor" ->
-        print_session_doctor(session, config)
+        print_session_doctor(session, config, front_eval)
         session
 
       "capabilities" ->
@@ -324,22 +453,22 @@ defmodule Elv.CLI do
     end
   end
 
-  defp handle_command({:help, ""}, session, _editor, _config) do
+  defp dispatch_command({:help, ""}, session, _editor, _config, _front_eval) do
     IO.puts(repl_help())
     session
   end
 
-  defp handle_command({:help, topic}, session, _editor, _config) do
+  defp dispatch_command({:help, topic}, session, _editor, _config, _front_eval) do
     run_v(session, ["help", topic])
     session
   end
 
-  defp handle_command({:shell, ""}, session, _editor, _config) do
+  defp dispatch_command({:shell, ""}, session, _editor, _config, _front_eval) do
     IO.puts(:stderr, "usage: ; command")
     session
   end
 
-  defp handle_command({:shell, command}, session, _editor, _config) do
+  defp dispatch_command({:shell, command}, session, _editor, _config, _front_eval) do
     {shell, args} = shell_command(command)
 
     {output, status} =
@@ -354,12 +483,12 @@ defmodule Elv.CLI do
       session
   end
 
-  defp handle_command({:pkg, ""}, session, _editor, _config) do
+  defp dispatch_command({:pkg, ""}, session, _editor, _config, _front_eval) do
     IO.puts("V package mode: ] install <module> | ] search <term> | ] update | ] list")
     session
   end
 
-  defp handle_command({:pkg, command}, session, _editor, _config) do
+  defp dispatch_command({:pkg, command}, session, _editor, _config, _front_eval) do
     {subcommand, args} = split_command(command)
 
     case subcommand do
@@ -744,7 +873,7 @@ defmodule Elv.CLI do
     """)
   end
 
-  defp print_session_doctor(session, config) do
+  defp print_session_doctor(session, config, front_eval) do
     metadata = session_metadata(session)
 
     IO.puts("#{Elv.product_name()} #{Elv.version()}")
@@ -760,6 +889,12 @@ defmodule Elv.CLI do
     IO.puts("checkpoint count: #{metadata.snapshot_count}")
     IO.puts("lsp: #{format_lsp(metadata)}")
 
+    if front_eval do
+      IO.puts(
+        "front fast: #{front_fast_status(front_eval)} reason=#{front_eval.frozen_reason || "(none)"} pending=#{length(front_eval.pending_rev)} synced=#{front_eval.synced_count} native_fallbacks=#{front_eval.native_fallback_count}"
+      )
+    end
+
     if metadata.snapshot_last_path,
       do: IO.puts("latest checkpoint: #{metadata.snapshot_last_path}")
 
@@ -774,6 +909,12 @@ defmodule Elv.CLI do
       )
 
       if metadata.last_source_path, do: IO.puts("last source: #{metadata.last_source_path}")
+    end
+
+    if Map.has_key?(metadata, :fast_eval_hits) do
+      IO.puts(
+        "fast eval: hits=#{metadata.fast_eval_hits} misses=#{metadata.fast_eval_misses} time=#{format_time(metadata.fast_eval_us)} fallback=#{metadata.fallback_eval_count}"
+      )
     end
 
     if Map.has_key?(metadata, :worker_alive?),
@@ -798,6 +939,12 @@ defmodule Elv.CLI do
 
     if metadata[:hot_last_error],
       do: IO.puts("hot reload error: #{String.trim(metadata.hot_last_error)}")
+
+    if metadata[:daemon_status],
+      do: IO.puts("daemon backend: #{metadata.daemon_status} #{metadata.daemon_reason}")
+
+    if metadata[:last_daemon_error],
+      do: IO.puts("daemon backend error: #{String.trim(metadata.last_daemon_error)}")
 
     if metadata[:v_daemon] == :enabled do
       IO.puts(
@@ -1020,7 +1167,7 @@ defmodule Elv.CLI do
   defp repl_usage do
     """
     Usage:
-      elv repl [--v PATH] [--cwd DIR] [--timeout MS] [--tmp-root DIR] [--snapshot-root DIR] [--backend replay|worker|live|plugin] [--worker-recycle-after N] [--hot-generation-retention N] [--hot-recycle-after-generations N] [--lsp] [--lsp-command PATH] [--no-snapshots]
+      elv repl [--v PATH] [--cwd DIR] [--timeout MS] [--tmp-root DIR] [--snapshot-root DIR] [--backend replay|daemon|worker|live|plugin] [--worker-recycle-after N] [--hot-generation-retention N] [--hot-recycle-after-generations N] [--lsp] [--lsp-command PATH] [--no-snapshots]
 
     V lookup order:
       1. --v / --v-path
@@ -1051,6 +1198,16 @@ defmodule Elv.CLI do
   end
 
   defp session_metadata(session), do: SessionServer.metadata(session)
+
+  defp session_fallback_count(session) do
+    metadata = session_metadata(session)
+
+    Map.get(metadata, :fallback_eval_count, 0) +
+      Map.get(metadata, :daemon_eval_count, 0)
+  end
+
+  defp front_fast_status(%{enabled?: true}), do: "front_fast=enabled"
+  defp front_fast_status(_front_eval), do: "front_fast=frozen"
 
   defp format_snapshots(%{snapshots: :disabled}), do: "disabled"
 
@@ -1090,12 +1247,13 @@ defmodule Elv.CLI do
   defp normalize_backend(nil), do: {:ok, Elv.Engine}
   defp normalize_backend(""), do: {:ok, Elv.Engine}
   defp normalize_backend("replay"), do: {:ok, Elv.Engine}
+  defp normalize_backend("daemon"), do: {:ok, Elv.DaemonBackend}
   defp normalize_backend("worker"), do: {:ok, Elv.WorkerBackend}
   defp normalize_backend("live"), do: {:ok, Elv.HotReloadBackend}
   defp normalize_backend("plugin"), do: {:ok, Elv.HotReloadBackend}
 
   defp normalize_backend(other),
-    do: {:error, "Unknown backend: #{other}; expected replay, worker, live, or plugin"}
+    do: {:error, "Unknown backend: #{other}; expected replay, daemon, worker, live, or plugin"}
 
   defp hot_reload_mode("plugin"), do: :plugin
   defp hot_reload_mode(_backend_name), do: :live

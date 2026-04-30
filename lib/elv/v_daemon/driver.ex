@@ -15,6 +15,11 @@ defmodule Elv.VDaemon.Driver do
               {:ok, map(), state()} | {:error, binary(), state()}
   @callback unload(state(), generation_record(), keyword()) ::
               {:ok, map(), state()} | {:error, binary(), state()}
+  @callback eval(state(), source :: binary(), keyword()) ::
+              {:ok, map(), state()} | {:error, binary(), state()}
+  @callback reset(state(), keyword()) :: {:ok, map(), state()} | {:error, binary(), state()}
+  @callback snapshot(state(), keyword()) ::
+              {:ok, map(), state()} | {:error, binary(), state()}
   @callback recycle(state(), binary(), keyword()) ::
               {:ok, map(), state()} | {:error, binary(), state()}
   @callback metadata(state()) :: map()

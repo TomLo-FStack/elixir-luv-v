@@ -153,6 +153,17 @@ defmodule ElvTest do
     end
 
     @impl true
+    def eval(state, source, _opts) do
+      {:ok, %{stdout: source <> "\n", stderr: "", status: 0, elapsed_us: 5}, state}
+    end
+
+    @impl true
+    def reset(state, _opts), do: {:ok, %{reset?: true}, state}
+
+    @impl true
+    def snapshot(state, _opts), do: {:ok, %{source: "", forms: 0}, state}
+
+    @impl true
     def recycle(state, reason, _opts) do
       {:ok, %{mock_recycled?: true}, %{state | recycled: state.recycled ++ [reason]}}
     end
@@ -165,6 +176,70 @@ defmodule ElvTest do
         fake_v_daemon_loaded: state.loaded,
         fake_v_daemon_unloaded: state.unloaded,
         fake_v_daemon_recycled: state.recycled
+      }
+    end
+  end
+
+  defmodule EvalVDaemonDriver do
+    @behaviour Elv.VDaemon.Driver
+
+    defstruct evals: [], resets: 0, snapshots: 0, fail_eval?: false, fail_after: nil
+
+    @impl true
+    def start(config) do
+      {:ok,
+       %__MODULE__{
+         fail_eval?: Map.get(config, :fail_eval?, false),
+         fail_after: Map.get(config, :fail_after)
+       }}
+    end
+
+    @impl true
+    def stop(_state), do: :ok
+
+    @impl true
+    def build(state, _spec, _opts), do: {:error, "build unsupported", state}
+
+    @impl true
+    def load(state, _artifact, _opts), do: {:error, "load unsupported", state}
+
+    @impl true
+    def unload(state, _record, _opts), do: {:error, "unload unsupported", state}
+
+    @impl true
+    def eval(%{fail_eval?: true} = state, _source, _opts),
+      do: {:error, "mock eval failure", state}
+
+    def eval(%{fail_after: max, evals: evals} = state, _source, _opts)
+        when is_integer(max) and length(evals) >= max,
+        do: {:error, "mock eval failure after #{max}", state}
+
+    def eval(state, "bad", _opts) do
+      {:ok, %{stdout: "", stderr: "mock compile error", status: 1, elapsed_us: 13}, state}
+    end
+
+    def eval(state, source, _opts) do
+      result = %{stdout: source <> "\n", stderr: "", status: 0, elapsed_us: 13}
+      {:ok, result, %{state | evals: state.evals ++ [source]}}
+    end
+
+    @impl true
+    def reset(state, _opts), do: {:ok, %{reset?: true}, %{state | resets: state.resets + 1}}
+
+    @impl true
+    def snapshot(state, _opts) do
+      {:ok, %{source: Enum.join(state.evals, "\n")}, %{state | snapshots: state.snapshots + 1}}
+    end
+
+    @impl true
+    def recycle(state, reason, _opts), do: {:ok, %{reason: reason}, state}
+
+    @impl true
+    def metadata(state) do
+      %{
+        fake_eval_daemon_evals: state.evals,
+        fake_eval_daemon_resets: state.resets,
+        fake_eval_daemon_snapshots: state.snapshots
       }
     end
   end
@@ -188,6 +263,15 @@ defmodule ElvTest do
     def unload(state, _record, _opts), do: {:error, "not started", state}
 
     @impl true
+    def eval(state, _source, _opts), do: {:error, "not started", state}
+
+    @impl true
+    def reset(state, _opts), do: {:error, "not started", state}
+
+    @impl true
+    def snapshot(state, _opts), do: {:error, "not started", state}
+
+    @impl true
     def recycle(state, _reason, _opts), do: {:error, "not started", state}
 
     @impl true
@@ -197,7 +281,7 @@ defmodule ElvTest do
   test "product metadata is stable" do
     assert Elv.product_name() == "Elixir Luv V"
     assert Elv.short_name() == "ELV"
-    assert Elv.version() == "0.2.0"
+    assert Elv.version() == "0.3.0"
   end
 
   test "scanner detects incomplete V blocks" do
@@ -234,6 +318,24 @@ defmodule ElvTest do
     assert Elv.Form.main_function?("fn main() {}")
     assert Elv.Form.side_effecting?("println(value)")
     refute Elv.Form.side_effecting?("value + 1")
+    assert Elv.Form.statement?("value := 1")
+    assert Elv.Form.statement?("mut value := 1")
+    assert Elv.Form.statement?("println(value)")
+    assert Elv.Form.statement?("assert value == 1")
+    refute Elv.Form.statement?("value + 1")
+    assert Elv.Form.obvious_statement?("value := 1")
+    assert Elv.Form.obvious_statement?("println(value)")
+    assert Elv.Form.obvious_statement?("for i in 0 .. 3 { println(i) }")
+    refute Elv.Form.obvious_statement?("if true { 1 } else { 2 }")
+
+    assert {:ok, ["mut counter := 1", "counter += 2"], "counter"} =
+             Elv.Form.trailing_expression_sequence("mut counter := 1; counter += 2; counter")
+
+    assert Elv.Form.execution_body_forms("mut counter := 1; counter += 2; counter") == [
+             "mut counter := 1",
+             "counter += 2",
+             "println(counter)"
+           ]
 
     form = Elv.Form.snapshot("println(value)", 2)
 
@@ -243,6 +345,84 @@ defmodule ElvTest do
     assert form.source_sha256 == Elv.Form.sha256("println(value)")
     assert form.side_effecting?
     refute form.deterministic?
+  end
+
+  test "fast eval handles simple stateful REPL forms" do
+    state = Elv.FastEval.new()
+
+    assert {:ok, "2\n", _elapsed_us, state} = Elv.FastEval.eval("1+1", state)
+    assert {:ok, "14\n", _elapsed_us, state} = Elv.FastEval.eval("2 + 3 * 4", state)
+    assert {:ok, "2\n", _elapsed_us, state} = Elv.FastEval.eval("7 / 3", state)
+    assert {:ok, "1\n", _elapsed_us, state} = Elv.FastEval.eval("7 % 3", state)
+    assert {:ok, "-9\n", _elapsed_us, state} = Elv.FastEval.eval("-(2 + 7)", state)
+    assert {:ok, "10010\n", _elapsed_us, state} = Elv.FastEval.eval("10000 ^ 10", state)
+
+    assert {:ok, "", _elapsed_us, state} = Elv.FastEval.eval("value := 1", state)
+    assert {:ok, "3\n", _elapsed_us, state} = Elv.FastEval.eval("value + 2", state)
+    assert :error = Elv.FastEval.eval("value = 3", state)
+    assert {:ok, "", _elapsed_us, state} = Elv.FastEval.eval("mut counter := 1", state)
+    assert {:ok, "", _elapsed_us, state} = Elv.FastEval.eval("counter += 2", state)
+    assert {:ok, "3\n", _elapsed_us, state} = Elv.FastEval.eval("counter", state)
+
+    assert {:ok, "", _elapsed_us, state} =
+             Elv.FastEval.eval("fn add(a int, b int) int { return a + b }", state)
+
+    assert {:ok, "3\n", _elapsed_us, state} = Elv.FastEval.eval("add(1, 2)", state)
+
+    assert {:ok, "", _elapsed_us, state} = Elv.FastEval.eval("import math", state)
+    assert {:ok, "9.0\n", _elapsed_us, _state} = Elv.FastEval.eval("math.sqrt(81)", state)
+  end
+
+  test "engine fast path preserves V state and output across fallback" do
+    v_path = System.get_env("ELV_TEST_V") || "E:/v_go_ds50_benchmark/tools/v/v.exe"
+
+    unless File.exists?(v_path) do
+      IO.puts("skipping real V fast-path integration test; set ELV_TEST_V to enable it")
+    end
+
+    if File.exists?(v_path) do
+      tmp_root =
+        Path.join(System.tmp_dir!(), "elv_test_fast_engine_#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf(tmp_root) end)
+
+      assert {:ok, engine} = Elv.Engine.start(v_path, File.cwd!(), tmp_root: tmp_root)
+
+      assert {:ok, "2\n", _elapsed_us, engine} = Elv.Engine.eval(engine, "1+1")
+      assert Elv.Engine.metadata(engine).build_cache_misses == 0
+
+      assert {:ok, "10010\n", _elapsed_us, engine} = Elv.Engine.eval(engine, "10000 ^ 10")
+      assert {:ok, "", _elapsed_us, engine} = Elv.Engine.eval(engine, "value := 1")
+      assert {:ok, "3\n", _elapsed_us, engine} = Elv.Engine.eval(engine, "value + 2")
+      assert {:ok, "2\n", _elapsed_us, engine} = Elv.Engine.eval(engine, "7 / 3")
+      assert {:ok, "1\n", _elapsed_us, engine} = Elv.Engine.eval(engine, "7 % 3")
+
+      assert {:ok, "", _elapsed_us, engine} =
+               Elv.Engine.eval(engine, "fn add(a int, b int) int { return a + b }")
+
+      assert {:ok, "3\n", _elapsed_us, engine} = Elv.Engine.eval(engine, "add(1, 2)")
+      assert {:ok, "", _elapsed_us, engine} = Elv.Engine.eval(engine, "import math")
+      assert {:ok, "9.0\n", _elapsed_us, engine} = Elv.Engine.eval(engine, "math.sqrt(81)")
+
+      # Unsupported expression falls back to V, but the generated program still
+      # contains state established by previous fast-path forms and does not replay
+      # previous fast-path expression output.
+      assert {:ok, "3\n", _elapsed_us, engine} =
+               Elv.Engine.eval(engine, "if value == 1 { 3 } else { 4 }")
+
+      assert {:ok, "3\n", _elapsed_us, engine} =
+               Elv.Engine.eval(engine, "mut counter := 1; counter += 2; counter")
+
+      metadata = Elv.Engine.metadata(engine)
+      assert metadata.fast_eval_hits == 10
+      assert metadata.fast_eval_misses == 2
+      assert metadata.build_cache_misses == 2
+      assert metadata.fallback_eval_count == 2
+      assert metadata.imports == 1
+      assert metadata.declarations == 1
+
+      assert :ok = Elv.Engine.close(engine)
+    end
   end
 
   test "build server renders generation-specific source files and reuses identical source" do
@@ -364,6 +544,178 @@ defmodule ElvTest do
     assert metadata.fake_v_daemon_loaded == ["g1", "g2", "g2"]
 
     assert :ok = Elv.VDaemon.close(daemon)
+  end
+
+  test "V daemon eval, reset, and snapshot use the driver protocol" do
+    tmp_dir =
+      Path.join(System.tmp_dir!(), "elv_test_eval_daemon_#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf(tmp_dir) end)
+
+    {:ok, daemon} =
+      Elv.VDaemon.start_link(%{
+        mode: :daemon,
+        v_path: "v",
+        cwd: File.cwd!(),
+        tmp_dir: tmp_dir,
+        driver: EvalVDaemonDriver
+      })
+
+    assert {:ok, %{stdout: "1 + 2\n", status: 0, elapsed_us: 13}} =
+             Elv.VDaemon.eval(daemon, "1 + 2")
+
+    assert {:ok, %{source: "1 + 2"}} = Elv.VDaemon.snapshot(daemon)
+    assert {:ok, %{reset?: true}} = Elv.VDaemon.reset(daemon)
+
+    metadata = Elv.VDaemon.metadata(daemon)
+    assert metadata.v_daemon_mode == :daemon
+    assert metadata.fake_eval_daemon_evals == ["1 + 2"]
+    assert metadata.fake_eval_daemon_snapshots == 1
+    assert metadata.fake_eval_daemon_resets == 1
+
+    assert :ok = Elv.VDaemon.close(daemon)
+  end
+
+  test "daemon backend uses daemon eval as authoritative execution" do
+    tmp_root =
+      Path.join(
+        System.tmp_dir!(),
+        "elv_test_daemon_backend_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(tmp_root) end)
+
+    assert {:ok, backend} =
+             Elv.DaemonBackend.start("v", File.cwd!(),
+               tmp_root: tmp_root,
+               v_daemon_driver: EvalVDaemonDriver,
+               daemon_fallback_backend: FakeBackend
+             )
+
+    assert {:ok, "value := 1\n", 13, backend} =
+             Elv.DaemonBackend.eval(backend, "value := 1", [])
+
+    assert {:error, message, backend} = Elv.DaemonBackend.eval(backend, "bad", [])
+    assert message =~ "mock compile error"
+
+    metadata = Elv.DaemonBackend.metadata(backend)
+    assert metadata.backend == :daemon
+    assert metadata.daemon_authoritative
+    assert metadata.daemon_eval_count == 1
+    assert metadata.daemon_error_count == 1
+    assert metadata.daemon_snapshot_count == 1
+    assert metadata.fake_eval_daemon_evals == ["value := 1"]
+    assert metadata.imports == 0
+    assert metadata.declarations == 0
+    assert metadata.body_forms == 1
+
+    assert :ok = Elv.DaemonBackend.close(backend)
+  end
+
+  test "daemon backend degrades to replay when daemon cannot start" do
+    tmp_root =
+      Path.join(
+        System.tmp_dir!(),
+        "elv_test_daemon_degraded_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(tmp_root) end)
+
+    assert {:ok, backend} =
+             Elv.DaemonBackend.start("v", File.cwd!(),
+               tmp_root: tmp_root,
+               v_daemon_driver: FailingVDaemonDriver,
+               daemon_fallback_backend: FakeBackend
+             )
+
+    assert {:ok, "1 + 2\n", 7, backend} = Elv.DaemonBackend.eval(backend, "1 + 2", [])
+
+    metadata = Elv.DaemonBackend.metadata(backend)
+    assert metadata.backend == :daemon
+    refute metadata.daemon_authoritative
+    assert metadata.daemon_status == :degraded
+    assert metadata.daemon_reason =~ "replay backend is authoritative"
+    assert metadata.last_daemon_error == "native daemon unavailable"
+
+    assert :ok = Elv.DaemonBackend.close(backend)
+  end
+
+  test "daemon backend replays daemon history before fallback after eval failure" do
+    tmp_root =
+      Path.join(
+        System.tmp_dir!(),
+        "elv_test_daemon_fallback_replay_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(tmp_root) end)
+
+    assert {:ok, backend} =
+             Elv.DaemonBackend.start("v", File.cwd!(),
+               tmp_root: tmp_root,
+               v_daemon_driver: EvalVDaemonDriver,
+               v_daemon_config: %{fail_after: 1},
+               daemon_fallback_backend: FakeBackend
+             )
+
+    assert {:ok, "seed := 1\n", 13, backend} =
+             Elv.DaemonBackend.eval(backend, "seed := 1", [])
+
+    assert {:ok, "seed + 1\n", 7, backend} =
+             Elv.DaemonBackend.eval(backend, "seed + 1", [])
+
+    metadata = Elv.DaemonBackend.metadata(backend)
+    assert metadata.daemon_status == :degraded
+    assert metadata.generation == 2
+    assert metadata.body_forms == 2
+    assert metadata.last_daemon_error =~ "mock eval failure after 1"
+
+    assert :ok = Elv.DaemonBackend.close(backend)
+  end
+
+  test "daemon backend executes real V stateful forms when V is available" do
+    v_path = System.get_env("ELV_TEST_V") || "E:/v_go_ds50_benchmark/tools/v/v.exe"
+
+    unless File.exists?(v_path) do
+      IO.puts("skipping real V daemon integration test; set ELV_TEST_V to enable it")
+    end
+
+    if File.exists?(v_path) do
+      tmp_root =
+        Path.join(System.tmp_dir!(), "elv_test_real_daemon_#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf(tmp_root) end)
+
+      assert {:ok, backend} = Elv.DaemonBackend.start(v_path, File.cwd!(), tmp_root: tmp_root)
+      assert Elv.DaemonBackend.metadata(backend).daemon_status == :enabled
+
+      assert {:ok, "", _elapsed_us, backend} =
+               Elv.DaemonBackend.eval(backend, "value := 1", [])
+
+      assert {:ok, "3\n", _elapsed_us, backend} =
+               Elv.DaemonBackend.eval(backend, "if value == 1 { 3 } else { 4 }", [])
+
+      assert {:ok, "3\n", _elapsed_us, backend} =
+               Elv.DaemonBackend.eval(backend, "mut counter := 1; counter += 2; counter", [])
+
+      assert {:ok, "", _elapsed_us, backend} = Elv.DaemonBackend.eval(backend, "import math", [])
+
+      assert {:ok, "9.0\n", _elapsed_us, backend} =
+               Elv.DaemonBackend.eval(backend, "math.sqrt(81)", [])
+
+      assert {:error, message, backend} =
+               Elv.DaemonBackend.eval(backend, "missing_symbol + 1", [])
+
+      assert message =~ "v exited with status"
+
+      metadata = Elv.DaemonBackend.metadata(backend)
+      assert metadata.daemon_authoritative
+      assert metadata.daemon_eval_count == 5
+      assert metadata.daemon_error_count == 1
+      assert metadata.imports == 1
+      assert metadata.body_forms == 6
+
+      assert :ok = Elv.DaemonBackend.close(backend)
+    end
   end
 
   test "live backend exposes live capability through the V daemon lifecycle" do
@@ -512,6 +864,18 @@ defmodule ElvTest do
     assert [] = Elv.EditorServer.search(editor, "")
 
     assert :ok = Elv.EditorServer.close(editor)
+  end
+
+  test "fallback benchmark script exists and covers daemon comparison cases" do
+    script = File.read!("scripts/benchmark_repl_fallbacks.py")
+
+    assert script =~ "--backend\", \"daemon"
+    assert script =~ "if value == 1 { 3 } else { 4 }"
+    assert script =~ "slow_mul(1, 3)"
+    assert script =~ "m.sqrt(81)"
+    assert script =~ "for i in 0 .. 1"
+    assert script =~ "if true { 0 } else { 1 }"
+    assert script =~ "V-compile-bound"
   end
 
   test "V locator normalizes quoted user paths" do

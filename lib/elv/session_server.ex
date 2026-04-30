@@ -394,6 +394,7 @@ defmodule Elv.SessionServer do
     [
       tmp_root: Map.get(config, :tmp_root),
       worker_backend: Map.get(config, :worker_backend, Elv.Engine),
+      daemon_fallback_backend: Map.get(config, :daemon_fallback_backend, Elv.Engine),
       hot_reload_mode: Map.get(config, :hot_reload_mode, :live),
       hot_generation_retention: Map.get(config, :hot_generation_retention, 2),
       hot_recycle_after_generations: Map.get(config, :hot_recycle_after_generations, 50)

@@ -54,6 +54,7 @@ References:
 ELV should use these capabilities where they fit, but not couple the product to only one backend. The architecture should allow multiple execution strategies:
 
 - replay backend: current safe baseline, simple and portable;
+- daemon backend: long-running V control process with source-level authoritative session state;
 - `v -live` backend: fast function-level hot reload where type layouts stay stable;
 - plugin backend: generated shared libraries loaded by a long-running V daemon;
 - worker backend: isolated native process per risky execution, with snapshot restore.

@@ -15,7 +15,12 @@ defmodule Elv.Engine do
     :imports,
     :decls,
     :body,
-    :previous_output
+    :previous_output,
+    :fast_eval,
+    :fast_eval_hits,
+    :fast_eval_misses,
+    :fast_eval_us,
+    :fallback_eval_count
   ]
 
   @hard_timeout_ms 30_000
@@ -35,7 +40,12 @@ defmodule Elv.Engine do
          imports: [],
          decls: [],
          body: [],
-         previous_output: ""
+         previous_output: "",
+         fast_eval: Elv.FastEval.new(),
+         fast_eval_hits: 0,
+         fast_eval_misses: 0,
+         fast_eval_us: 0,
+         fallback_eval_count: 0
        }}
     end
   rescue
@@ -74,13 +84,13 @@ defmodule Elv.Engine do
          engine}
 
       Form.import?(code) ->
-        add_import(engine, code, opts)
+        add_fast_or_import(engine, code, opts)
 
       Form.declaration?(code) ->
-        add_declaration(engine, code, opts)
+        add_fast_or_declaration(engine, code, opts)
 
       true ->
-        eval_expression_or_statement(engine, code, opts)
+        eval_fast_or_expression(engine, code, opts)
     end
   end
 
@@ -90,15 +100,18 @@ defmodule Elv.Engine do
 
     task =
       Task.async(fn ->
-        System.cmd(engine.v_path, args,
-          cd: engine.cwd,
-          env: command_env(engine),
-          stderr_to_stdout: true
-        )
+        command_result(fn ->
+          System.cmd(engine.v_path, args,
+            cd: engine.cwd,
+            env: command_env(engine),
+            stderr_to_stdout: true
+          )
+        end)
       end)
 
     case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, status}} -> {normalize_output(output), status}
+      {:ok, {:ok, {output, status}}} -> {normalize_output(output), status}
+      {:ok, {:error, message}} -> {message, 1}
       nil -> {"command timed out after #{timeout_ms} ms", 124}
     end
   rescue
@@ -155,8 +168,13 @@ defmodule Elv.Engine do
       imports: length(engine.imports),
       declarations: length(engine.decls),
       body_forms: length(engine.body),
+      fast_eval_hits: engine.fast_eval_hits,
+      fast_eval_misses: engine.fast_eval_misses,
+      fast_eval_us: engine.fast_eval_us,
+      fallback_eval_count: engine.fallback_eval_count,
       capabilities: %{
         replay: true,
+        fast_eval: true,
         worker_isolation: false,
         lsp: false,
         snapshots: true,
@@ -165,6 +183,26 @@ defmodule Elv.Engine do
       }
     }
     |> Map.merge(BuildServer.metadata(engine.build_server))
+  end
+
+  defp add_fast_or_import(engine, code, opts) do
+    case Elv.FastEval.eval(code, engine.fast_eval) do
+      {:ok, output, elapsed_us, fast_eval} ->
+        imports = Enum.uniq(engine.imports ++ [code])
+
+        engine =
+          engine
+          |> record_fast_hit(elapsed_us, fast_eval)
+          |> Map.merge(%{
+            imports: imports,
+            previous_output: engine.previous_output <> output
+          })
+
+        {:ok, output, elapsed_us, engine}
+
+      :error ->
+        engine |> record_fast_miss() |> add_import(code, opts)
+    end
   end
 
   defp add_import(engine, code, opts) do
@@ -177,6 +215,26 @@ defmodule Elv.Engine do
 
       {:error, message, engine} ->
         {:error, message, engine}
+    end
+  end
+
+  defp add_fast_or_declaration(engine, code, opts) do
+    case Elv.FastEval.eval(code, engine.fast_eval) do
+      {:ok, output, elapsed_us, fast_eval} ->
+        decls = engine.decls ++ [code]
+
+        engine =
+          engine
+          |> record_fast_hit(elapsed_us, fast_eval)
+          |> Map.merge(%{
+            decls: decls,
+            previous_output: engine.previous_output <> output
+          })
+
+        {:ok, output, elapsed_us, engine}
+
+      :error ->
+        engine |> record_fast_miss() |> add_declaration(code, opts)
     end
   end
 
@@ -193,7 +251,57 @@ defmodule Elv.Engine do
     end
   end
 
+  defp eval_fast_or_expression(engine, code, opts) do
+    case Elv.FastEval.eval(code, engine.fast_eval) do
+      {:ok, output, elapsed_us, fast_eval} ->
+        engine =
+          engine
+          |> record_fast_hit(elapsed_us, fast_eval)
+          |> sync_fast_body(code, output)
+
+        {:ok, output, elapsed_us, engine}
+
+      :error ->
+        engine |> record_fast_miss() |> eval_expression_or_statement(code, opts)
+    end
+  end
+
+  defp sync_fast_body(engine, code, output) do
+    body =
+      cond do
+        match?({:ok, _prefix, _expression}, Form.trailing_expression_sequence(code)) ->
+          engine.body ++ Form.execution_body_forms(code)
+
+        output != "" and Form.statement?(code) ->
+          engine.body ++ [code]
+
+        output != "" ->
+          engine.body ++ ["println(#{code})"]
+
+        Form.statement?(code) ->
+          engine.body ++ [code]
+
+        true ->
+          engine.body
+      end
+
+    %{engine | body: body, previous_output: engine.previous_output <> output}
+  end
+
   defp eval_expression_or_statement(engine, code, opts) do
+    cond do
+      match?({:ok, _prefix, _expression}, Form.trailing_expression_sequence(code)) ->
+        eval_statement(engine, code, opts)
+
+      Form.obvious_statement?(code) ->
+        eval_statement(engine, code, opts)
+
+      true ->
+        eval_expression_then_statement(engine, code, opts)
+    end
+  end
+
+  defp eval_expression_then_statement(engine, code, opts) do
     expression_body = engine.body ++ ["println(#{code})"]
 
     case run_candidate(engine, engine.imports, engine.decls, expression_body, opts) do
@@ -202,12 +310,9 @@ defmodule Elv.Engine do
          %{engine | body: expression_body, previous_output: output}}
 
       {:error, expr_message, engine} ->
-        statement_body = engine.body ++ [code]
-
-        case run_candidate(engine, engine.imports, engine.decls, statement_body, opts) do
+        case eval_statement(engine, code, opts) do
           {:ok, output, elapsed, engine} ->
-            {:ok, delta(engine.previous_output, output), elapsed,
-             %{engine | body: statement_body, previous_output: output}}
+            {:ok, output, elapsed, engine}
 
           {:error, stmt_message, engine} ->
             message =
@@ -222,7 +327,22 @@ defmodule Elv.Engine do
     end
   end
 
+  defp eval_statement(engine, code, opts) do
+    statement_body = engine.body ++ Form.execution_body_forms(code)
+
+    case run_candidate(engine, engine.imports, engine.decls, statement_body, opts) do
+      {:ok, output, elapsed, engine} ->
+        {:ok, delta(engine.previous_output, output), elapsed,
+         %{engine | body: statement_body, previous_output: output}}
+
+      {:error, message, engine} ->
+        {:error, message, engine}
+    end
+  end
+
   defp run_candidate(engine, imports, decls, body, opts) do
+    engine = %{engine | fallback_eval_count: engine.fallback_eval_count + 1}
+
     case BuildServer.render(engine.build_server, imports, decls, body) do
       {:ok, artifact} ->
         engine = %{engine | seq: artifact.generation}
@@ -245,19 +365,24 @@ defmodule Elv.Engine do
 
     task =
       Task.async(fn ->
-        System.cmd(engine.v_path, ["-w", "-n", "-nocolor", "run", path],
-          cd: engine.cwd,
-          env: command_env(engine),
-          stderr_to_stdout: true
-        )
+        command_result(fn ->
+          System.cmd(engine.v_path, ["-w", "-n", "-nocolor", "run", path],
+            cd: engine.cwd,
+            env: command_env(engine),
+            stderr_to_stdout: true
+          )
+        end)
       end)
 
     case Task.yield(task, hard_timeout_ms) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, 0}} ->
+      {:ok, {:ok, {output, 0}}} ->
         {:ok, normalize_output(output), System.monotonic_time(:microsecond) - started_us}
 
-      {:ok, {output, status}} ->
+      {:ok, {:ok, {output, status}}} ->
         {:error, "v exited with status #{status}\n#{normalize_output(output)}"}
+
+      {:ok, {:error, message}} ->
+        {:error, message}
 
       nil ->
         {:error, "Evaluation timed out after #{hard_timeout_ms} ms."}
@@ -272,8 +397,29 @@ defmodule Elv.Engine do
     end
   end
 
+  defp record_fast_hit(engine, elapsed_us, fast_eval) do
+    %{
+      engine
+      | fast_eval: fast_eval,
+        fast_eval_hits: engine.fast_eval_hits + 1,
+        fast_eval_us: engine.fast_eval_us + elapsed_us
+    }
+  end
+
+  defp record_fast_miss(engine) do
+    %{engine | fast_eval_misses: engine.fast_eval_misses + 1}
+  end
+
   defp normalize_output(output) do
     String.replace(output, "\r\n", "\n")
+  end
+
+  defp command_result(fun) do
+    {:ok, fun.()}
+  rescue
+    error -> {:error, Exception.message(error)}
+  catch
+    :exit, reason -> {:error, "command failed: #{inspect(reason)}"}
   end
 
   defp make_tmp_dir(nil) do

@@ -184,7 +184,7 @@ defmodule Elv.HotReloadBackend do
         %{state | decls: state.decls ++ [code]}
 
       :execution ->
-        %{state | body: state.body ++ [body_form(code)]}
+        %{state | body: state.body ++ body_form(code)}
     end
   end
 
@@ -345,19 +345,7 @@ defmodule Elv.HotReloadBackend do
   end
 
   defp body_form(code) do
-    if statement?(code), do: code, else: "println(#{code})"
-  end
-
-  defp statement?(code) do
-    trimmed = String.trim_leading(code)
-
-    Form.side_effecting?(code) or
-      String.match?(trimmed, ~r/^[A-Za-z_][A-Za-z0-9_]*(\s*(:=|[+\-*\/%]?=)|\s*\[)/) or
-      String.match?(trimmed, ~r/^(mut\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:=/) or
-      String.match?(
-        trimmed,
-        ~r/^(if|for|match|unsafe|lock|rlock|defer|assert|return|break|continue)\b/
-      )
+    Form.execution_body_forms(code)
   end
 
   defp summarize_load(load) do

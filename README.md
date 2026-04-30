@@ -17,7 +17,7 @@ v> ?run
 
 ELV ships as a universal escript package. The package embeds Elixir code, but it still needs Erlang/OTP's `escript` command on PATH.
 
-1. Download `elixir-luv-v-0.2.0-universal.zip` or `.tar.gz` from the GitHub release.
+1. Download `elixir-luv-v-0.3.0-universal.zip` or `.tar.gz` from the GitHub release.
 2. Unpack it.
 3. Add the unpacked `bin` directory to PATH.
 4. Run:
@@ -124,6 +124,14 @@ elv repl --backend worker
 elv repl --backend worker --worker-recycle-after 100
 ```
 
+The authoritative native daemon backend can be enabled with:
+
+```sh
+elv repl --backend daemon
+```
+
+This starts a long-running V control process for source-level session execution. If it is unavailable, ELV reports the degradation in `:doctor` and uses replay execution as the authoritative backend.
+
 Hot-load backends can be enabled with:
 
 ```sh
@@ -142,7 +150,7 @@ elv repl --lsp
 
 ## How It Works
 
-V is a compiled language, not a dynamic interpreter. ELV runs as an OTP application: a supervised session server owns source-level checkpoints and runtime metadata, while an editor server owns the active input buffer and searchable submitted-form history. The replay backend asks a build server to render and cache generated V source files, runs `v run`, and prints only the new output suffix. Optional LSP hooks talk JSON-RPC to a V language server for diagnostics and completion without making that server a required dependency. The optional worker backend runs the evaluator behind a supervised disposable worker process, so worker crashes can be counted, replaced, automatically recovered from checkpoints, and proactively recycled. The optional live/plugin backend starts a V daemon and loads generation-specific native artifacts while keeping replay as the recovery-safe source of truth. Deterministic snippets feel stateful; code with side effects are tracked in each checkpoint replay plan so recovery can report what it replayed and what it skipped.
+V is a compiled language, not a dynamic interpreter. ELV runs as an OTP application: a supervised session server owns source-level checkpoints and runtime metadata, while an editor server owns the active input buffer and searchable submitted-form history. The replay backend asks a build server to render and cache generated V source files, runs `v run`, and prints only the new output suffix. Optional LSP hooks talk JSON-RPC to a V language server for diagnostics and completion without making that server a required dependency. The optional worker backend runs the evaluator behind a supervised disposable worker process, so worker crashes can be counted, replaced, automatically recovered from checkpoints, and proactively recycled. The daemon backend keeps a long-running V control process as the authoritative native session executor. The optional live/plugin backend starts a V daemon and loads generation-specific native artifacts while keeping replay as the recovery-safe source of truth. Deterministic snippets feel stateful; code with side effects are tracked in each checkpoint replay plan so recovery can report what it replayed and what it skipped.
 
 ## North Star
 

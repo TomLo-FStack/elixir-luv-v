@@ -3,7 +3,7 @@ defmodule Elv do
   Product metadata for Elixir Luv V.
   """
 
-  @version "0.2.0"
+  @version "0.3.0"
   @product_name "Elixir Luv V"
   @short_name "ELV"
 

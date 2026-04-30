@@ -33,6 +33,7 @@ defmodule Elv.VDaemon.SystemDriver do
     File.mkdir_p!(state.tmp_dir)
 
     case state.mode do
+      :daemon -> start_eval_daemon(state, config)
       :plugin -> start_plugin_daemon(state, config)
       :live -> start_live_daemon(state, config)
       other -> {:error, "unknown V daemon mode: #{inspect(other)}"}
@@ -95,6 +96,11 @@ defmodule Elv.VDaemon.SystemDriver do
     error -> {:error, Exception.message(error), %{state | last_error: Exception.message(error)}}
   end
 
+  def build(%__MODULE__{mode: :daemon} = state, _spec, _opts) do
+    message = "generation build is not supported by the authoritative daemon backend"
+    {:error, message, %{state | last_error: message}}
+  end
+
   @impl true
   def load(%__MODULE__{mode: :plugin} = state, artifact, opts) do
     symbol = Map.get(artifact, :symbol, "elv_generation_entry")
@@ -129,6 +135,11 @@ defmodule Elv.VDaemon.SystemDriver do
     end
   end
 
+  def load(%__MODULE__{mode: :daemon} = state, _artifact, _opts) do
+    message = "generation load is not supported by the authoritative daemon backend"
+    {:error, message, %{state | last_error: message}}
+  end
+
   @impl true
   def unload(%__MODULE__{mode: :plugin} = state, record, opts) do
     command = "unload #{record.generation}"
@@ -150,11 +161,80 @@ defmodule Elv.VDaemon.SystemDriver do
     {:error, message, %{state | last_error: message}}
   end
 
+  def unload(%__MODULE__{mode: :daemon} = state, _record, _opts) do
+    message = "generation unload is not supported by the authoritative daemon backend"
+    {:error, message, %{state | last_error: message}}
+  end
+
+  @impl true
+  def eval(%__MODULE__{mode: :daemon} = state, source, opts) do
+    command = "eval " <> Base.encode64(source)
+
+    case command(state, command, opts) do
+      {:ok, "eval " <> payload, state} ->
+        parse_eval_payload(payload, state)
+
+      {:ok, message, state} ->
+        {:error, "unexpected daemon eval response: #{message}", state}
+
+      {:error, message, state} ->
+        {:error, message, state}
+    end
+  end
+
+  def eval(%__MODULE__{} = state, _source, _opts) do
+    message = "eval is only supported by authoritative daemon mode"
+    {:error, message, %{state | last_error: message}}
+  end
+
+  @impl true
+  def reset(%__MODULE__{mode: :daemon} = state, opts) do
+    case command(state, "reset", opts) do
+      {:ok, "reset " <> payload, state} ->
+        {:ok, %{message: payload}, state}
+
+      {:ok, message, state} ->
+        {:error, "unexpected daemon reset response: #{message}", state}
+
+      {:error, message, state} ->
+        {:error, message, state}
+    end
+  end
+
+  def reset(%__MODULE__{} = state, _opts) do
+    message = "reset is only supported by authoritative daemon mode"
+    {:error, message, %{state | last_error: message}}
+  end
+
+  @impl true
+  def snapshot(%__MODULE__{mode: :daemon} = state, opts) do
+    case command(state, "snapshot", opts) do
+      {:ok, "snapshot " <> payload, state} ->
+        parse_snapshot_payload(payload, state)
+
+      {:ok, message, state} ->
+        {:error, "unexpected daemon snapshot response: #{message}", state}
+
+      {:error, message, state} ->
+        {:error, message, state}
+    end
+  end
+
+  def snapshot(%__MODULE__{} = state, _opts) do
+    message = "snapshot is only supported by authoritative daemon mode"
+    {:error, message, %{state | last_error: message}}
+  end
+
   @impl true
   def recycle(%__MODULE__{} = state, reason, opts) do
     state = close_port(state)
 
     case state.mode do
+      :daemon ->
+        with {:ok, state} <- start_eval_daemon(%{state | port: nil}, Map.new(opts)) do
+          {:ok, %{recycle_message: reason}, state}
+        end
+
       :plugin ->
         with {:ok, state} <- start_plugin_daemon(%{state | port: nil}, Map.new(opts)) do
           {:ok, %{recycle_message: reason}, state}
@@ -217,6 +297,37 @@ defmodule Elv.VDaemon.SystemDriver do
 
     with {:ok, port} <- open_port(state.v_path, ["-live", "run", source_path], state.cwd),
          state = %{state | port: port, live_source_path: source_path, last_error: nil} do
+      {:ok, state}
+    else
+      {:error, message} -> {:error, message}
+      {:error, message, _state} -> {:error, message}
+    end
+  end
+
+  defp start_eval_daemon(%__MODULE__{} = state, config) do
+    daemon_dir = Path.join(state.tmp_dir, "daemon")
+    session_dir = Path.join(state.tmp_dir, "daemon_session")
+    File.mkdir_p!(daemon_dir)
+    File.mkdir_p!(session_dir)
+
+    source_path = Path.join(daemon_dir, "elv_eval_daemon.v")
+    executable_path = Path.join(daemon_dir, "elv_eval_daemon" <> executable_extension())
+
+    File.write!(source_path, eval_daemon_source(state.v_path, session_dir))
+
+    timeout_ms = Map.get(config, :daemon_build_timeout_ms, @default_timeout_ms)
+
+    with {:ok, output} <- run_v(state, ["-o", executable_path, source_path], timeout_ms),
+         {:ok, port} <- open_port(executable_path, [], state.cwd),
+         state = %{
+           state
+           | port: port,
+             daemon_source_path: source_path,
+             daemon_executable_path: executable_path,
+             last_output: output,
+             last_error: nil
+         },
+         {:ok, _ready, state} <- read_control(state, @default_timeout_ms, "ready") do
       {:ok, state}
     else
       {:error, message} -> {:error, message}
@@ -306,6 +417,47 @@ defmodule Elv.VDaemon.SystemDriver do
 
   defp expected_control?(message, expect) do
     message == "ok #{expect}" or message == expect
+  end
+
+  defp parse_eval_payload(payload, state) do
+    case payload |> Base.decode64!() |> String.split("|", parts: 5) do
+      [status_text, elapsed_text, stdout64, stderr64, source64] ->
+        with {status, ""} <- Integer.parse(status_text),
+             {elapsed_us, ""} <- Integer.parse(elapsed_text),
+             {:ok, stdout} <- Base.decode64(stdout64),
+             {:ok, stderr} <- Base.decode64(stderr64),
+             {:ok, source} <- Base.decode64(source64) do
+          {:ok,
+           %{
+             status: status,
+             elapsed_us: elapsed_us,
+             stdout: normalize_output(stdout),
+             stderr: normalize_output(stderr),
+             source: source
+           }, state}
+        else
+          _ ->
+            {:error, "invalid daemon eval payload",
+             %{state | last_error: "invalid daemon eval payload"}}
+        end
+
+      _ ->
+        {:error, "invalid daemon eval payload",
+         %{state | last_error: "invalid daemon eval payload"}}
+    end
+  rescue
+    error -> {:error, Exception.message(error), %{state | last_error: Exception.message(error)}}
+  end
+
+  defp parse_snapshot_payload(payload, state) do
+    case Base.decode64(payload) do
+      {:ok, source} ->
+        {:ok, %{source: source}, state}
+
+      :error ->
+        {:error, "invalid daemon snapshot payload",
+         %{state | last_error: "invalid daemon snapshot payload"}}
+    end
   end
 
   defp open_port(executable, args, cwd) do
@@ -537,6 +689,289 @@ defmodule Elv.VDaemon.SystemDriver do
     """
   end
 
+  defp eval_daemon_source(v_path, session_dir) do
+    v_path = escape_v_string(v_path)
+    session_dir = escape_v_string(session_dir)
+
+    """
+    module main
+
+    import encoding.base64
+    import os
+    import time
+
+    const elv_v_path = '#{v_path}'
+    const elv_session_dir = '#{session_dir}'
+    const elv_control_prefix = '#{@control_prefix}'
+
+    struct SessionState {
+      imports []string
+      declarations []string
+      body []string
+      previous_output string
+      generation int
+    }
+
+    fn clean(text string) string {
+      return text.replace('\\n', ' ').replace('\\r', ' ')
+    }
+
+    fn control(status string, message string) {
+      println(elv_control_prefix + status + ' ' + clean(message))
+      flush_stdout()
+    }
+
+    fn quote_arg(value string) string {
+      return '"' + value.replace('"', '\\\\"') + '"'
+    }
+
+    fn join_blocks(items []string) string {
+      mut text := ''
+      for item in items {
+        if item.trim_space() == '' {
+          continue
+        }
+        if text != '' {
+          text += '\\n\\n'
+        }
+        text += item
+      }
+      return text
+    }
+
+    fn indent_body(items []string) string {
+      mut text := ''
+      for item in items {
+        for line in item.split('\\n') {
+          text += '    ' + line + '\\n'
+        }
+      }
+      return text
+    }
+
+    fn render_source(state SessionState) string {
+      return 'module main\\n\\n' + join_blocks(state.imports) + '\\n\\n' +
+        join_blocks(state.declarations) + '\\n\\nfn main() {\\n' + indent_body(state.body) + '}\\n'
+    }
+
+    fn delta(previous string, current string) string {
+      if current.starts_with(previous) {
+        return current[previous.len..]
+      }
+      return current
+    }
+
+    fn source_kind(source string) string {
+      trimmed := source.trim_space()
+      if trimmed.starts_with('import ') || trimmed.starts_with('import(') {
+        return 'import'
+      }
+      for prefix in ['fn ', 'pub fn ', 'struct ', 'enum ', 'interface ', 'type ', 'const ', 'const(', '__global'] {
+        if trimmed.starts_with(prefix) {
+          return 'declaration'
+        }
+      }
+      return 'execution'
+    }
+
+    fn is_statement(source string) bool {
+      trimmed := source.trim_space()
+      if trimmed.contains('println(') || trimmed.contains('print(') || trimmed.contains('panic(') {
+        return true
+      }
+      for prefix in ['mut ', 'if ', 'for ', 'match ', 'assert ', 'defer ', 'return', 'break', 'continue', 'unsafe', 'lock ', 'rlock '] {
+        if trimmed.starts_with(prefix) {
+          return true
+        }
+      }
+      return trimmed.contains(':=') || trimmed.contains(' +=') || trimmed.contains(' -=') ||
+        trimmed.contains(' *=') || trimmed.contains(' /=') || trimmed.contains(' %=') ||
+        trimmed.ends_with('++') || trimmed.ends_with('--')
+    }
+
+    fn is_obvious_statement(source string) bool {
+      trimmed := source.trim_space()
+      if trimmed.contains('println(') || trimmed.contains('print(') || trimmed.contains('panic(') {
+        return true
+      }
+      for prefix in ['mut ', 'for ', 'assert ', 'defer ', 'return', 'break', 'continue', 'unsafe', 'lock ', 'rlock '] {
+        if trimmed.starts_with(prefix) {
+          return true
+        }
+      }
+      return trimmed.contains(':=') || trimmed.contains(' +=') || trimmed.contains(' -=') ||
+        trimmed.contains(' *=') || trimmed.contains(' /=') || trimmed.contains(' %=') ||
+        trimmed.ends_with('++') || trimmed.ends_with('--')
+    }
+
+    fn trailing_expression_sequence(source string) ?[]string {
+      trimmed := source.trim_space()
+      if trimmed.contains(';') && !trimmed.contains('{') && !trimmed.contains('}') && !trimmed.contains('\\n') {
+        raw_parts := trimmed.split(';')
+        mut parts := []string{}
+        for part in raw_parts {
+          item := part.trim_space()
+          if item != '' {
+            parts << item
+          }
+        }
+        if parts.len > 1 {
+          tail := parts[parts.len - 1]
+          if !is_statement(tail) && source_kind(tail) == 'execution' {
+            mut forms := []string{}
+            for i := 0; i < parts.len - 1; i++ {
+              forms << parts[i]
+            }
+            forms << 'println(' + tail + ')'
+            return forms
+          }
+        }
+      }
+      return none
+    }
+
+    fn execution_forms(source string, expression_first bool) []string {
+      trimmed := source.trim_space()
+      if forms := trailing_expression_sequence(trimmed) {
+        return forms
+      }
+      if expression_first {
+        return ['println(' + trimmed + ')']
+      }
+      if is_statement(trimmed) {
+        return [trimmed]
+      }
+      return ['println(' + trimmed + ')']
+    }
+
+    fn candidate_state(state SessionState, source string, expression_first bool) SessionState {
+      kind := source_kind(source)
+      if kind == 'import' {
+        mut imports := state.imports.clone()
+        if source !in imports {
+          imports << source
+        }
+        return SessionState{
+          ...state
+          imports: imports
+        }
+      }
+      if kind == 'declaration' {
+        mut declarations := state.declarations.clone()
+        declarations << source
+        return SessionState{
+          ...state
+          declarations: declarations
+        }
+      }
+      mut body := state.body.clone()
+      body << execution_forms(source, expression_first)
+      return SessionState{
+        ...state
+        body: body
+      }
+    }
+
+    fn run_once(state SessionState, source string, expression_first bool) (SessionState, string, int, int) {
+      mut candidate := candidate_state(state, source, expression_first)
+      candidate = SessionState{
+        ...candidate
+        generation: state.generation + 1
+      }
+      rendered := render_source(candidate)
+      path := os.join_path(elv_session_dir, 'session_' + candidate.generation.str() + '.v')
+      os.write_file(path, rendered) or {
+        return state, err.msg(), 1, 0
+      }
+      started := time.now()
+      result := os.execute(quote_arg(elv_v_path) + ' -w -n -nocolor run ' + quote_arg(path))
+      elapsed_us := int(time.since(started).microseconds())
+      if result.exit_code == 0 {
+        output := result.output.replace('\\r\\n', '\\n')
+        candidate = SessionState{
+          ...candidate
+          previous_output: output
+        }
+        return candidate, delta(state.previous_output, output), 0, elapsed_us
+      }
+      return state, result.output.replace('\\r\\n', '\\n'), result.exit_code, elapsed_us
+    }
+
+    fn run_candidate(state SessionState, source string) (SessionState, string, int, int) {
+      kind := source_kind(source)
+      if kind == 'import' || kind == 'declaration' || is_obvious_statement(source) {
+        return run_once(state, source, false)
+      }
+
+      expr_state, expr_output, expr_status, expr_elapsed := run_once(state, source, true)
+      if expr_status == 0 {
+        return expr_state, expr_output, expr_status, expr_elapsed
+      }
+
+      stmt_state, stmt_output, stmt_status, stmt_elapsed := run_once(state, source, false)
+      if stmt_status == 0 {
+        return stmt_state, stmt_output, stmt_status, stmt_elapsed
+      }
+
+      return state, stmt_output, stmt_status, stmt_elapsed
+    }
+
+    fn encode_eval(status int, elapsed_us int, stdout string, stderr string, source string) string {
+      payload := status.str() + '|' + elapsed_us.str() + '|' + base64.encode(stdout.bytes()) + '|' +
+        base64.encode(stderr.bytes()) + '|' + base64.encode(source.bytes())
+      return base64.encode(payload.bytes())
+    }
+
+    fn main() {
+      os.mkdir_all(elv_session_dir) or {
+        control('error', err.msg())
+        return
+      }
+      mut state := SessionState{}
+      control('ok', 'ready')
+
+      for {
+        line := os.get_line()
+        if line == '' {
+          continue
+        }
+
+        if line == 'quit' {
+          control('ok', 'quit')
+          return
+        }
+
+        if line == 'reset' {
+          state = SessionState{}
+          control('ok', 'reset ok')
+          continue
+        }
+
+        if line == 'snapshot' {
+          control('ok', 'snapshot ' + base64.encode(render_source(state).bytes()))
+          continue
+        }
+
+        if line.starts_with('eval ') {
+          encoded := line['eval '.len..]
+          source := base64.decode_str(encoded)
+          next_state, output, status, elapsed_us := run_candidate(state, source)
+          if status == 0 {
+            state = next_state
+            control('ok', 'eval ' + encode_eval(status, elapsed_us, output, '', render_source(state)))
+          } else {
+            stderr := 'v exited with status ' + status.str() + '\\n' + output
+            control('ok', 'eval ' + encode_eval(status, elapsed_us, '', stderr, render_source(state)))
+          }
+          continue
+        }
+
+        control('error', 'unknown command: ' + line)
+      }
+    }
+    """
+  end
+
   defp join_blocks(blocks), do: blocks |> Enum.reject(&(&1 == "")) |> Enum.join("\n\n")
 
   defp indent_body([]), do: ""
@@ -560,6 +995,12 @@ defmodule Elv.VDaemon.SystemDriver do
   defp join_output(output), do: output |> Enum.reverse() |> Enum.join("\n")
 
   defp normalize_output(output), do: String.replace(output, "\r\n", "\n")
+
+  defp escape_v_string(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("'", "\\'")
+  end
 
   defp shared_library_extension do
     cond do
