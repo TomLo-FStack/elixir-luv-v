@@ -4,7 +4,7 @@ defmodule Elv.MixProject do
   def project do
     [
       app: :elv,
-      version: "0.1.0",
+      version: "0.2.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       escript: [main_module: Elv.CLI, name: "elv"],
@@ -17,6 +17,7 @@ defmodule Elv.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
+      mod: {Elv.Application, []},
       extra_applications: [:logger, :crypto]
     ]
   end

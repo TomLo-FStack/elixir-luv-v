@@ -17,7 +17,7 @@ v> ?run
 
 ELV ships as a universal escript package. The package embeds Elixir code, but it still needs Erlang/OTP's `escript` command on PATH.
 
-1. Download `elixir-luv-v-0.1.0-universal.zip` or `.tar.gz` from the GitHub release.
+1. Download `elixir-luv-v-0.2.0-universal.zip` or `.tar.gz` from the GitHub release.
 2. Unpack it.
 3. Add the unpacked `bin` directory to PATH.
 4. Run:
@@ -96,10 +96,17 @@ elv v path               # print the active V executable
 :help                  show REPL help
 :quit                  exit
 :reset                 restart the session
+:recover               restore replay-safe forms from the latest checkpoint
+:crashes               show crash and timeout counters
 :version               print V version
 :vpath                 show active V executable
 :doctor                show session diagnostics
+:capabilities          show backend capability flags
+:snapshots             show checkpoint and replay-plan details
+:diagnostics           show latest LSP diagnostics when LSP is enabled
+:complete source       ask LSP for completions at the end of source
 :history               show submitted V forms
+:search query          search submitted V forms
 :load file.v           load a V snippet
 :run file.v [args]     run a V file outside the session
 :check file.v          compile-check a V file
@@ -110,9 +117,32 @@ elv v path               # print the active V executable
 @time expr             evaluate and print elapsed wall time
 ```
 
+Worker-isolated execution can be enabled with:
+
+```sh
+elv repl --backend worker
+elv repl --backend worker --worker-recycle-after 100
+```
+
+Hot-load backends can be enabled with:
+
+```sh
+elv repl --backend live
+elv repl --backend plugin
+elv repl --backend plugin --hot-generation-retention 2 --hot-recycle-after-generations 50
+```
+
+These modes start a supervised `VDaemon`, compile generation-specific V artifacts, and manage load/unload/recycle policy without overwriting an already-loaded library. Replay execution remains authoritative for REPL output and checkpoint recovery; the hot-load path is reported separately in `:doctor` so native generation status is visible.
+
+Optional V language-server hooks can be enabled when `v-analyzer` is installed:
+
+```sh
+elv repl --lsp
+```
+
 ## How It Works
 
-V is a compiled language, not a dynamic interpreter. ELV keeps a session model in Elixir, renders it into a temporary V program, runs `v run`, and prints only the new output suffix. Deterministic snippets feel stateful; code with side effects may run again when the session is replayed.
+V is a compiled language, not a dynamic interpreter. ELV runs as an OTP application: a supervised session server owns source-level checkpoints and runtime metadata, while an editor server owns the active input buffer and searchable submitted-form history. The replay backend asks a build server to render and cache generated V source files, runs `v run`, and prints only the new output suffix. Optional LSP hooks talk JSON-RPC to a V language server for diagnostics and completion without making that server a required dependency. The optional worker backend runs the evaluator behind a supervised disposable worker process, so worker crashes can be counted, replaced, automatically recovered from checkpoints, and proactively recycled. The optional live/plugin backend starts a V daemon and loads generation-specific native artifacts while keeping replay as the recovery-safe source of truth. Deterministic snippets feel stateful; code with side effects are tracked in each checkpoint replay plan so recovery can report what it replayed and what it skipped.
 
 ## North Star
 

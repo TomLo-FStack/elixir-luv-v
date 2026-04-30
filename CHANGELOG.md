@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0 - 2026-04-30
+
+- Started the v0.2 runtime foundation: ELV now boots as an OTP application with a dynamic session supervisor.
+- Moved the replay evaluator behind an execution backend behaviour so future live/plugin/worker backends can share the same session surface.
+- Added a SessionServer for runtime metadata, history ownership, restart handling, evaluation timing, timeout counts, and crash accounting.
+- Expanded session diagnostics with backend, temp root, snapshot status, generation, form counts, and compile/run timing details.
+- Added source-level checkpoint files with deterministic/side-effecting form tracking.
+- Added `:recover` for latest-checkpoint replay and `:crashes` for visible crash/timeout counters.
+- Added a supervised disposable worker backend, exposed with `elv repl --backend worker`.
+- Added worker crash replacement tests so the session process survives a crashed execution worker.
+- Started the v0.3 editor layer with an EditorServer for multiline input buffering, submitted-form history, and `:search`.
+- Added a shared form classifier and BuildServer foundation for generated-source caching and future live/plugin backends.
+- Added optional LSP client plumbing with JSON-RPC framing plus `:diagnostics` and `:complete` hooks for `elv repl --lsp`.
+- Added explicit checkpoint replay plans so recovery reports replayed and skipped side-effecting forms.
+- Added automatic crash recovery from checkpoints and worker recycle policy support with replay restore.
+- Added real `VDaemon`-backed `live` and `plugin` backend entry points with generation-specific artifacts, load/unload tracking, recycle policy, capability diagnostics, and replay fallback.
+- Added `:capabilities` and `:snapshots` commands for inspecting backend support and recovery state.
+
 ## 0.1.0 - 2026-04-30
 
 Initial public release.

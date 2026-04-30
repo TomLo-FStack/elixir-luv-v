@@ -1,10 +1,16 @@
 defmodule Elv.Engine do
   @moduledoc false
 
+  @behaviour Elv.ExecutionBackend
+
+  alias Elv.BuildServer
+  alias Elv.Form
+
   defstruct [
     :v_path,
     :cwd,
     :tmp_dir,
+    :build_server,
     :seq,
     :imports,
     :decls,
@@ -14,31 +20,38 @@ defmodule Elv.Engine do
 
   @hard_timeout_ms 30_000
 
+  @impl true
   def start(v_path, cwd, opts \\ []) do
     tmp_dir = make_tmp_dir(Keyword.get(opts, :tmp_root))
 
-    {:ok,
-     %__MODULE__{
-       v_path: v_path,
-       cwd: cwd,
-       tmp_dir: tmp_dir,
-       seq: 0,
-       imports: [],
-       decls: [],
-       body: [],
-       previous_output: ""
-     }}
+    with {:ok, build_server} <- BuildServer.start_link(tmp_dir: tmp_dir) do
+      {:ok,
+       %__MODULE__{
+         v_path: v_path,
+         cwd: cwd,
+         tmp_dir: tmp_dir,
+         build_server: build_server,
+         seq: 0,
+         imports: [],
+         decls: [],
+         body: [],
+         previous_output: ""
+       }}
+    end
   rescue
     error -> {:error, Exception.message(error)}
   end
 
-  def close(%__MODULE__{tmp_dir: tmp_dir}) do
+  @impl true
+  def close(%__MODULE__{tmp_dir: tmp_dir, build_server: build_server}) do
+    if is_pid(build_server), do: BuildServer.close(build_server)
     if is_binary(tmp_dir), do: File.rm_rf(tmp_dir)
     :ok
   rescue
     _ -> :ok
   end
 
+  @impl true
   def restart(%__MODULE__{} = engine, opts \\ []) do
     v_path = engine.v_path
     cwd = engine.cwd
@@ -48,6 +61,7 @@ defmodule Elv.Engine do
 
   def eval(engine, code, opts \\ [])
 
+  @impl true
   def eval(%__MODULE__{} = engine, code, opts) do
     code = String.trim(code)
 
@@ -55,14 +69,14 @@ defmodule Elv.Engine do
       code == "" ->
         {:ok, "", 0, engine}
 
-      main_function?(code) ->
+      Form.main_function?(code) ->
         {:error, "Do not define fn main() inside the REPL session; use :run for full V programs.",
          engine}
 
-      import?(code) ->
+      Form.import?(code) ->
         add_import(engine, code, opts)
 
-      declaration?(code) ->
+      Form.declaration?(code) ->
         add_declaration(engine, code, opts)
 
       true ->
@@ -70,6 +84,7 @@ defmodule Elv.Engine do
     end
   end
 
+  @impl true
   def run_v(%__MODULE__{} = engine, args, opts \\ []) do
     timeout_ms = Keyword.get(opts, :timeout_ms, @hard_timeout_ms)
 
@@ -90,6 +105,7 @@ defmodule Elv.Engine do
     error -> {Exception.message(error), 1}
   end
 
+  @impl true
   def split_forms(code, scanner \\ Elv.Scanner) do
     {forms, pending} =
       code
@@ -125,6 +141,30 @@ defmodule Elv.Engine do
     |> Enum.reverse()
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
+  end
+
+  @impl true
+  def metadata(%__MODULE__{} = engine) do
+    %{
+      backend: :replay,
+      v_path: engine.v_path,
+      cwd: engine.cwd,
+      tmp_dir: engine.tmp_dir,
+      tmp_root: Path.dirname(engine.tmp_dir),
+      generation: engine.seq,
+      imports: length(engine.imports),
+      declarations: length(engine.decls),
+      body_forms: length(engine.body),
+      capabilities: %{
+        replay: true,
+        worker_isolation: false,
+        lsp: false,
+        snapshots: true,
+        live_reload: false,
+        plugins: false
+      }
+    }
+    |> Map.merge(BuildServer.metadata(engine.build_server))
   end
 
   defp add_import(engine, code, opts) do
@@ -183,14 +223,17 @@ defmodule Elv.Engine do
   end
 
   defp run_candidate(engine, imports, decls, body, opts) do
-    seq = engine.seq + 1
-    source = render(imports, decls, body)
-    path = Path.join(engine.tmp_dir, "session_#{seq}.v")
-    File.write!(path, source)
+    case BuildServer.render(engine.build_server, imports, decls, body) do
+      {:ok, artifact} ->
+        engine = %{engine | seq: artifact.generation}
 
-    case run_v_file(engine, path, opts) do
-      {:ok, output, elapsed} -> {:ok, output, elapsed, %{engine | seq: seq}}
-      {:error, message} -> {:error, message, %{engine | seq: seq}}
+        case run_v_file(engine, artifact.path, opts) do
+          {:ok, output, elapsed} -> {:ok, output, elapsed, engine}
+          {:error, message} -> {:error, message, engine}
+        end
+
+      {:error, message} ->
+        {:error, message, engine}
     end
   rescue
     error -> {:error, Exception.message(error), engine}
@@ -221,36 +264,6 @@ defmodule Elv.Engine do
     end
   end
 
-  defp render(imports, decls, body) do
-    imports_text = join_blocks(imports)
-    decls_text = join_blocks(decls)
-    body_text = indent_body(body)
-
-    """
-    module main
-
-    #{imports_text}
-
-    #{decls_text}
-
-    fn main() {
-    #{body_text}
-    }
-    """
-  end
-
-  defp join_blocks(blocks), do: blocks |> Enum.reject(&(&1 == "")) |> Enum.join("\n\n")
-
-  defp indent_body([]), do: ""
-
-  defp indent_body(forms) do
-    forms
-    |> Enum.join("\n")
-    |> String.split("\n")
-    |> Enum.map(&("    " <> &1))
-    |> Enum.join("\n")
-  end
-
   defp delta(previous, current) do
     if String.starts_with?(current, previous) do
       binary_part(current, byte_size(previous), byte_size(current) - byte_size(previous))
@@ -261,29 +274,6 @@ defmodule Elv.Engine do
 
   defp normalize_output(output) do
     String.replace(output, "\r\n", "\n")
-  end
-
-  defp import?(code), do: String.match?(code, ~r/^\s*import(\s|\()/)
-
-  defp declaration?(code) do
-    normalized =
-      code
-      |> String.trim_leading()
-      |> strip_leading_attributes()
-
-    String.match?(
-      normalized,
-      ~r/^(pub\s+)?(fn|struct|enum|interface|type|const)\b|^const\s*\(|^__global\b/
-    )
-  end
-
-  defp main_function?(code), do: String.match?(code, ~r/^\s*(pub\s+)?fn\s+main\s*\(/)
-
-  defp strip_leading_attributes(code) do
-    code
-    |> String.split("\n")
-    |> Enum.drop_while(&(String.trim_leading(&1) |> String.starts_with?("@[")))
-    |> Enum.join("\n")
   end
 
   defp make_tmp_dir(nil) do

@@ -2,12 +2,15 @@ defmodule Elv.CLI do
   @moduledoc false
 
   alias Elv.Config
-  alias Elv.Engine
-  alias Elv.Scanner
+  alias Elv.EditorServer
+  alias Elv.SessionServer
+  alias Elv.SessionSupervisor
   alias Elv.VInstaller
   alias Elv.VLocator
 
   def main(argv) do
+    ensure_started()
+
     case argv do
       [] -> repl([])
       ["repl" | rest] -> repl(rest)
@@ -56,6 +59,14 @@ defmodule Elv.CLI do
           cwd: :string,
           timeout: :integer,
           tmp_root: :string,
+          snapshot_root: :string,
+          backend: :string,
+          lsp: :boolean,
+          lsp_command: :string,
+          worker_recycle_after: :integer,
+          hot_generation_retention: :integer,
+          hot_recycle_after_generations: :integer,
+          no_snapshots: :boolean,
           no_banner: :boolean
         ],
         aliases: [h: :help]
@@ -70,13 +81,23 @@ defmodule Elv.CLI do
 
       true ->
         with {:ok, cwd} <- normalize_cwd(opts[:cwd]),
+             {:ok, backend} <- normalize_backend(opts[:backend]),
              {:ok, v} <- VLocator.resolve(path: opts[:v] || opts[:v_path], cwd: cwd) do
           {:ok,
            %{
              v: v,
              cwd: cwd,
+             backend: backend,
+             backend_name: opts[:backend] || "replay",
              hard_timeout_ms: opts[:timeout] || 30_000,
              tmp_root: opts[:tmp_root],
+             snapshot_root: opts[:snapshot_root],
+             snapshots?: not (opts[:no_snapshots] || false),
+             lsp?: opts[:lsp] || false,
+             lsp_command: opts[:lsp_command],
+             worker_recycle_after: opts[:worker_recycle_after],
+             hot_generation_retention: opts[:hot_generation_retention],
+             hot_recycle_after_generations: opts[:hot_recycle_after_generations],
              no_banner?: opts[:no_banner] || false
            }}
         end
@@ -84,28 +105,52 @@ defmodule Elv.CLI do
   end
 
   defp run_repl(config) do
-    case Engine.start(config.v.path, config.cwd, tmp_root: config.tmp_root) do
-      {:ok, engine} ->
-        unless config.no_banner?, do: print_banner(engine, config)
-        loop(engine, config, [])
+    session_config = %{
+      v_path: config.v.path,
+      cwd: config.cwd,
+      backend: config.backend,
+      hot_reload_mode: hot_reload_mode(config.backend_name),
+      tmp_root: config.tmp_root,
+      snapshot_root: config.snapshot_root,
+      snapshots?: config.snapshots?,
+      lsp?: config.lsp?,
+      lsp_command: config.lsp_command,
+      worker_recycle_after: config.worker_recycle_after,
+      hot_generation_retention: config.hot_generation_retention,
+      hot_recycle_after_generations: config.hot_recycle_after_generations
+    }
+
+    case SessionSupervisor.start_session(session_config) do
+      {:ok, session} ->
+        case EditorServer.start_link() do
+          {:ok, editor} ->
+            unless config.no_banner?, do: print_banner(session, config)
+            loop(session, editor, config)
+
+          {:error, reason} ->
+            SessionServer.close(session)
+            fail("Could not start editor: #{inspect(reason)}", 1)
+        end
 
       {:error, message} ->
-        fail("Could not start #{Elv.short_name()}: #{message}", 1)
+        fail("Could not start #{Elv.short_name()}: #{inspect(message)}", 1)
     end
   end
 
-  defp loop(engine, config, history) do
-    case read_form() do
+  defp loop(session, editor, config) do
+    case read_form(editor) do
       :eof ->
-        Engine.close(engine)
+        SessionServer.close(session)
+        EditorServer.close(editor)
         IO.puts("")
 
       {:command, :quit} ->
-        Engine.close(engine)
+        SessionServer.close(session)
+        EditorServer.close(editor)
 
       {:command, command} ->
-        {engine, history} = handle_command(command, engine, config, history)
-        loop(engine, config, history)
+        session = handle_command(command, session, editor, config)
+        loop(session, editor, config)
 
       {:code, code} ->
         timed? = String.starts_with?(String.trim_leading(code), "@time ")
@@ -115,229 +160,242 @@ defmodule Elv.CLI do
             do: String.trim_leading(code) |> String.replace_prefix("@time ", ""),
             else: code
 
-        {engine, history} = eval_and_print(engine, config, code, history, timed?)
-        loop(engine, config, history)
+        session = eval_and_print(session, editor, config, code, timed?)
+        loop(session, editor, config)
     end
   end
 
-  defp read_form do
-    case IO.gets(color(:cyan, "v> ")) do
+  defp read_form(editor) do
+    case IO.gets(prompt(editor)) do
       eof when eof in [nil, :eof] ->
-        :eof
+        case EditorServer.flush(editor) do
+          :empty -> :eof
+          {:code, code} -> {:code, code}
+        end
 
       line ->
-        line = String.trim_trailing(line, "\n") |> String.trim_trailing("\r")
-        classify_first_line(line)
-    end
-  end
-
-  defp classify_first_line(line) do
-    trimmed = String.trim(line)
-
-    cond do
-      trimmed == "" ->
-        read_form()
-
-      trimmed in ["exit", ":q", ":quit"] ->
-        {:command, :quit}
-
-      String.starts_with?(trimmed, ":") ->
-        {:command, {:colon, trimmed}}
-
-      String.starts_with?(trimmed, "?") ->
-        {:command, {:help, String.trim_leading(trimmed, "?") |> String.trim()}}
-
-      String.starts_with?(trimmed, ";") ->
-        {:command, {:shell, String.trim_leading(trimmed, ";") |> String.trim()}}
-
-      String.starts_with?(trimmed, "]") ->
-        {:command, {:pkg, String.trim_leading(trimmed, "]") |> String.trim()}}
-
-      Scanner.complete?(line) ->
-        {:code, line}
-
-      true ->
-        read_continuation([line])
-    end
-  end
-
-  defp read_continuation(lines) do
-    case IO.gets(color(:light_black, "... ")) do
-      eof when eof in [nil, :eof] ->
-        {:code, Enum.reverse(lines) |> Enum.join("\n")}
-
-      line ->
-        line = String.trim_trailing(line, "\n") |> String.trim_trailing("\r")
-        lines = [line | lines]
-        code = Enum.reverse(lines) |> Enum.join("\n")
-
-        if Scanner.complete?(code) do
-          {:code, code}
-        else
-          read_continuation(lines)
+        case EditorServer.submit_line(editor, line) do
+          :blank -> read_form(editor)
+          :incomplete -> read_form(editor)
+          {:ready, {:command, command}} -> {:command, command}
+          {:ready, {:code, code}} -> {:code, code}
         end
     end
   end
 
-  defp eval_and_print(engine, config, code, history, timed?) do
-    history = history ++ [code]
-
-    case Engine.eval(engine, code, hard_timeout_ms: config.hard_timeout_ms) do
-      {:ok, output, elapsed_us, engine} ->
-        print_output(output)
-        if timed?, do: IO.puts(color(:light_black, "elapsed: #{format_time(elapsed_us)}"))
-        {engine, history}
-
-      {:error, message, engine} ->
-        IO.puts(:stderr, color(:red, message))
-        {engine, history}
+  defp prompt(editor) do
+    if EditorServer.buffering?(editor) do
+      color(:light_black, "... ")
+    else
+      color(:cyan, "v> ")
     end
   end
 
-  defp handle_command({:colon, line}, engine, config, history) do
+  defp eval_and_print(session, editor, config, code, timed?) do
+    EditorServer.record(editor, code)
+
+    case SessionServer.eval(session, code, hard_timeout_ms: config.hard_timeout_ms) do
+      {:ok, output, elapsed_us, session} ->
+        print_output(output)
+        if timed?, do: IO.puts(color(:light_black, "elapsed: #{format_time(elapsed_us)}"))
+        session
+
+      {:error, message, session} ->
+        IO.puts(:stderr, color(:red, message))
+        session
+    end
+  end
+
+  defp handle_command({:colon, line}, session, editor, config) do
     [command | rest] = String.split(String.trim_leading(line, ":"), ~r/\s+/, parts: 2)
     arg = rest |> List.first() |> Kernel.||("") |> String.trim()
 
     case command do
       "help" ->
         IO.puts(repl_help())
-        {engine, history}
+        session
 
       "version" ->
-        run_v(engine, ["version"])
-        {engine, history}
+        run_v(session, ["version"])
+        session
 
       "vpath" ->
-        IO.puts(engine.v_path)
-        {engine, history}
+        IO.puts(session_metadata(session).v_path)
+        session
 
       "doctor" ->
-        print_session_doctor(engine, config)
-        {engine, history}
+        print_session_doctor(session, config)
+        session
+
+      "capabilities" ->
+        print_capabilities(session_metadata(session))
+        session
+
+      "snapshots" ->
+        print_snapshots(session_metadata(session))
+        session
+
+      "diagnostics" ->
+        print_diagnostics(SessionServer.diagnostics(session))
+        session
+
+      "complete" ->
+        complete(arg, session)
+        session
+
+      "crashes" ->
+        print_crashes(session)
+        session
 
       "pwd" ->
-        IO.puts(engine.cwd)
-        {engine, history}
+        IO.puts(session_metadata(session).cwd)
+        session
 
       "clear" ->
         IO.write(IO.ANSI.clear() <> IO.ANSI.home())
-        {engine, history}
+        session
 
       "history" ->
-        print_history(history)
-        {engine, history}
+        print_history(EditorServer.history(editor))
+        session
+
+      "search" ->
+        if arg == "",
+          do: IO.puts(:stderr, "usage: :search query"),
+          else: print_search(EditorServer.search(editor, arg))
+
+        session
 
       "reset" ->
-        case Engine.restart(engine, tmp_root: config.tmp_root) do
-          {:ok, new_engine} ->
+        case SessionServer.restart(session, tmp_root: config.tmp_root) do
+          :ok ->
             IO.puts("session reset")
-            {new_engine, history}
+            session
 
           {:error, message} ->
             IO.puts(:stderr, color(:red, "reset failed: #{message}"))
-            {engine, history}
+            session
+        end
+
+      "recover" ->
+        case SessionServer.recover_latest(session, hard_timeout_ms: config.hard_timeout_ms) do
+          {:ok, count, skipped, elapsed_us, _session} ->
+            IO.puts(
+              "recovered #{count} form(s), skipped #{skipped} side-effecting form(s) in #{format_time(elapsed_us)}"
+            )
+
+            session
+
+          {:error, message, _session} ->
+            IO.puts(:stderr, color(:red, "recover failed: #{message}"))
+            session
         end
 
       "load" ->
-        load_file(arg, engine, config, history)
+        load_file(arg, session, editor, config)
 
       "run" ->
         if arg == "" do
           IO.puts(:stderr, "usage: :run path/to/file.v [args...]")
         else
           {file, args} = split_command(arg)
-          run_v(engine, ["run", file] ++ args)
+          run_v(session, ["run", file] ++ args)
         end
 
-        {engine, history}
+        session
 
       "check" ->
         if arg == "",
           do: IO.puts(:stderr, "usage: :check path/to/file.v"),
-          else: run_v(engine, [arg])
+          else: run_v(session, [arg])
 
-        {engine, history}
+        session
 
       "doc" ->
-        if arg == "", do: IO.puts(:stderr, "usage: :doc topic"), else: run_v(engine, ["doc", arg])
-        {engine, history}
+        if arg == "",
+          do: IO.puts(:stderr, "usage: :doc topic"),
+          else: run_v(session, ["doc", arg])
+
+        session
 
       other ->
         IO.puts(:stderr, "unknown command :#{other}; use :help")
-        {engine, history}
+        session
     end
   end
 
-  defp handle_command({:help, ""}, engine, _config, history) do
+  defp handle_command({:help, ""}, session, _editor, _config) do
     IO.puts(repl_help())
-    {engine, history}
+    session
   end
 
-  defp handle_command({:help, topic}, engine, _config, history) do
-    run_v(engine, ["help", topic])
-    {engine, history}
+  defp handle_command({:help, topic}, session, _editor, _config) do
+    run_v(session, ["help", topic])
+    session
   end
 
-  defp handle_command({:shell, ""}, engine, _config, history) do
+  defp handle_command({:shell, ""}, session, _editor, _config) do
     IO.puts(:stderr, "usage: ; command")
-    {engine, history}
+    session
   end
 
-  defp handle_command({:shell, command}, engine, _config, history) do
+  defp handle_command({:shell, command}, session, _editor, _config) do
     {shell, args} = shell_command(command)
-    {output, status} = System.cmd(shell, args, cd: engine.cwd, stderr_to_stdout: true)
+
+    {output, status} =
+      System.cmd(shell, args, cd: session_metadata(session).cwd, stderr_to_stdout: true)
+
     print_output(output)
     if status != 0, do: IO.puts(:stderr, color(:red, "shell exited with status #{status}"))
-    {engine, history}
+    session
   rescue
     error ->
       IO.puts(:stderr, color(:red, Exception.message(error)))
-      {engine, history}
+      session
   end
 
-  defp handle_command({:pkg, ""}, engine, _config, history) do
+  defp handle_command({:pkg, ""}, session, _editor, _config) do
     IO.puts("V package mode: ] install <module> | ] search <term> | ] update | ] list")
-    {engine, history}
+    session
   end
 
-  defp handle_command({:pkg, command}, engine, _config, history) do
+  defp handle_command({:pkg, command}, session, _editor, _config) do
     {subcommand, args} = split_command(command)
 
     case subcommand do
       cmd when cmd in ["install", "search", "update", "remove", "list", "outdated", "show"] ->
-        run_v(engine, [cmd] ++ args)
+        run_v(session, [cmd] ++ args)
 
       _ ->
         IO.puts(:stderr, "unknown V package command: #{subcommand}")
     end
 
-    {engine, history}
+    session
   end
 
-  defp load_file("", engine, _config, history) do
+  defp load_file("", session, _editor, _config) do
     IO.puts(:stderr, "usage: :load path/to/snippet.v")
-    {engine, history}
+    session
   end
 
-  defp load_file(path, engine, config, history) do
-    path = Path.expand(path, engine.cwd)
+  defp load_file(path, session, editor, config) do
+    path = Path.expand(path, session_metadata(session).cwd)
 
     case File.read(path) do
       {:ok, code} ->
-        code
-        |> Engine.split_forms()
-        |> Enum.reduce({engine, history}, fn form, {current_engine, current_history} ->
-          eval_and_print(current_engine, config, form, current_history, false)
+        SessionServer.split_forms(session, code)
+        |> Enum.reduce(session, fn form, current_session ->
+          eval_and_print(current_session, editor, config, form, false)
         end)
 
       {:error, reason} ->
         IO.puts(:stderr, color(:red, "could not read #{path}: #{:file.format_error(reason)}"))
-        {engine, history}
+        session
     end
   end
 
-  defp run_v(engine, args) do
-    {output, status} = Engine.run_v(engine, args)
+  defp run_v(session, args) do
+    {output, status} = SessionServer.run_v(session, args)
     print_output(output)
     if status != 0, do: IO.puts(:stderr, color(:red, "v exited with status #{status}"))
   end
@@ -629,27 +687,34 @@ defmodule Elv.CLI do
   end
 
   defp smoke_test(v_path, cwd) do
-    case Engine.start(v_path, cwd) do
-      {:ok, engine} ->
-        result = Engine.eval(engine, "1 + 2")
-        Engine.close(engine)
+    case SessionServer.start_link(%{v_path: v_path, cwd: cwd, tmp_root: nil}) do
+      {:ok, session} ->
+        result = SessionServer.eval(session, "1 + 2")
+        metadata = session_metadata(session)
+        SessionServer.close(session)
 
         case result do
-          {:ok, "3\n", _elapsed, _engine} ->
+          {:ok, "3\n", _elapsed, _session} ->
             IO.puts("smoke: ok")
 
-          {:ok, "3", _elapsed, _engine} ->
+          {:ok, "3", _elapsed, _session} ->
             IO.puts("smoke: ok")
 
-          {:ok, output, _elapsed, _engine} ->
+          {:ok, output, _elapsed, _session} ->
             IO.puts("smoke: unexpected output #{inspect(output)}")
 
-          {:error, message, _engine} ->
+          {:error, message, _session} ->
             IO.puts(:stderr, color(:red, "smoke: #{message}"))
         end
 
+        IO.puts("backend: #{metadata.backend}")
+        IO.puts("tmp root: #{metadata.tmp_root}")
+        IO.puts("snapshots: #{format_snapshots(metadata)}")
+        IO.puts("checkpoint: #{metadata.snapshot_count}")
+        IO.puts("last compile/run: #{format_optional_time(metadata.last_eval_us)}")
+
       {:error, message} ->
-        IO.puts(:stderr, color(:red, "smoke: #{message}"))
+        IO.puts(:stderr, color(:red, "smoke: #{inspect(message)}"))
     end
   end
 
@@ -663,26 +728,213 @@ defmodule Elv.CLI do
     IO.puts("  #{candidate.source}: #{candidate.path} [#{status}]")
   end
 
-  defp print_banner(engine, config) do
+  defp print_banner(session, config) do
+    metadata = session_metadata(session)
+
     IO.puts("""
     #{Elv.product_name()} #{Elv.version()}  |  #{config.v.version}
     short:   #{Elv.short_name()} / elv
-    backend: #{engine.v_path}
+    backend: #{metadata.backend}
+    v:       #{metadata.v_path}
     source:  #{config.v.source}
-    cwd:     #{engine.cwd}
-    tmp:     #{engine.tmp_dir}
+    cwd:     #{metadata.cwd}
+    tmp:     #{metadata.tmp_dir}
     Type :help for commands, :vpath for the active V path, :quit to exit.
     timeout: #{config.hard_timeout_ms} ms
     """)
   end
 
-  defp print_session_doctor(engine, config) do
+  defp print_session_doctor(session, config) do
+    metadata = session_metadata(session)
+
     IO.puts("#{Elv.product_name()} #{Elv.version()}")
-    IO.puts("backend: #{engine.v_path}")
+    IO.puts("session: #{metadata.session_id}")
+    IO.puts("started: #{metadata.started_at}")
+    IO.puts("backend: #{metadata.backend}")
+    IO.puts("v:       #{metadata.v_path}")
     IO.puts("source:  #{config.v.source}")
-    IO.puts("cwd:     #{engine.cwd}")
-    IO.puts("tmp:     #{engine.tmp_dir}")
-    run_v(engine, ["version"])
+    IO.puts("cwd:     #{metadata.cwd}")
+    IO.puts("tmp root: #{metadata.tmp_root}")
+    IO.puts("tmp:     #{metadata.tmp_dir}")
+    IO.puts("snapshots: #{format_snapshots(metadata)}")
+    IO.puts("checkpoint count: #{metadata.snapshot_count}")
+    IO.puts("lsp: #{format_lsp(metadata)}")
+
+    if metadata.snapshot_last_path,
+      do: IO.puts("latest checkpoint: #{metadata.snapshot_last_path}")
+
+    if metadata.snapshot_last_error,
+      do: IO.puts("snapshot error: #{metadata.snapshot_last_error}")
+
+    IO.puts("generation: #{metadata.generation}")
+
+    if Map.has_key?(metadata, :build_cache_entries) do
+      IO.puts(
+        "build cache: entries=#{metadata.build_cache_entries} hits=#{metadata.build_cache_hits} misses=#{metadata.build_cache_misses}"
+      )
+
+      if metadata.last_source_path, do: IO.puts("last source: #{metadata.last_source_path}")
+    end
+
+    if Map.has_key?(metadata, :worker_alive?),
+      do: IO.puts("worker alive: #{metadata.worker_alive?}")
+
+    if metadata[:worker_pid], do: IO.puts("worker pid: #{metadata.worker_pid}")
+
+    if metadata[:worker_backend],
+      do: IO.puts("worker backend: #{inspect(metadata.worker_backend)}")
+
+    if metadata[:worker_recycle_after],
+      do: IO.puts("worker recycle after: #{metadata.worker_recycle_after} eval(s)")
+
+    if metadata[:worker_recycle_count],
+      do: IO.puts("worker recycles: #{metadata.worker_recycle_count}")
+
+    if metadata[:last_worker_recycle],
+      do: IO.puts("last worker recycle: #{inspect(metadata.last_worker_recycle)}")
+
+    if metadata[:hot_reload],
+      do: IO.puts("hot reload: #{metadata.hot_reload} #{metadata.hot_reload_reason}")
+
+    if metadata[:hot_last_error],
+      do: IO.puts("hot reload error: #{String.trim(metadata.hot_last_error)}")
+
+    if metadata[:v_daemon] == :enabled do
+      IO.puts(
+        "v daemon: mode=#{metadata.v_daemon_mode} loaded=#{metadata.v_daemon_loaded_generation_count} active=#{metadata.v_daemon_active_generation} loads=#{metadata.v_daemon_load_count} unloads=#{metadata.v_daemon_unload_count} recycles=#{metadata.v_daemon_recycle_count}"
+      )
+    else
+      if Map.has_key?(metadata, :v_daemon),
+        do: IO.puts("v daemon: #{metadata.v_daemon} #{metadata[:v_daemon_last_error] || ""}")
+    end
+
+    if metadata[:v_daemon_last_recycle],
+      do: IO.puts("last v daemon recycle: #{inspect(metadata.v_daemon_last_recycle)}")
+
+    if metadata[:capabilities],
+      do: IO.puts("capabilities: #{format_capabilities(metadata.capabilities)}")
+
+    IO.puts(
+      "forms: imports=#{metadata.imports} declarations=#{metadata.declarations} body=#{metadata.body_forms}"
+    )
+
+    IO.puts(
+      "evals: #{metadata.eval_count} errors=#{metadata.error_count} crashes=#{metadata.crash_count} timeouts=#{metadata.timeout_count}"
+    )
+
+    IO.puts("last compile/run: #{format_optional_time(metadata.last_eval_us)}")
+    IO.puts("recoveries: #{metadata.recovery_count}")
+    IO.puts("last recovery: #{format_optional_time(metadata.last_recovery_us)}")
+
+    if not is_nil(metadata.last_replayed_count) do
+      IO.puts(
+        "last recovery plan: replayed=#{metadata.last_replayed_count} skipped=#{metadata.last_skipped_count}"
+      )
+    end
+
+    IO.puts("total compile/run: #{format_time(metadata.total_eval_us)}")
+    if metadata.last_error, do: IO.puts("last error: #{String.trim(metadata.last_error)}")
+    run_v(session, ["version"])
+  end
+
+  defp print_crashes(session) do
+    metadata = session_metadata(session)
+
+    IO.puts("crashes: #{metadata.crash_count}")
+    IO.puts("timeouts: #{metadata.timeout_count}")
+    IO.puts("errors: #{metadata.error_count}")
+    IO.puts("last error: #{metadata.last_error || "(none)"}")
+  end
+
+  defp print_capabilities(%{capabilities: capabilities}) do
+    capabilities
+    |> Enum.sort_by(fn {name, _enabled?} -> Atom.to_string(name) end)
+    |> Enum.each(fn {name, enabled?} ->
+      IO.puts("#{name}: #{if enabled?, do: "yes", else: "no"}")
+    end)
+  end
+
+  defp print_capabilities(_metadata), do: IO.puts("(no capability metadata)")
+
+  defp print_snapshots(metadata) do
+    IO.puts("snapshots: #{format_snapshots(metadata)}")
+    IO.puts("checkpoint count: #{metadata.snapshot_count}")
+
+    if metadata.snapshot_last_path,
+      do: IO.puts("latest checkpoint: #{metadata.snapshot_last_path}")
+
+    if metadata.last_replayed_count do
+      IO.puts("last replayed: #{metadata.last_replayed_count}")
+      IO.puts("last skipped: #{metadata.last_skipped_count}")
+    end
+  end
+
+  defp complete("", _session) do
+    IO.puts(:stderr, "usage: :complete source-prefix")
+  end
+
+  defp complete(source, session) do
+    line = source |> String.split("\n") |> length() |> Kernel.-(1)
+    character = source |> String.split("\n") |> List.last() |> String.length()
+
+    case SessionServer.complete(session, source, line, character) do
+      {:ok, result} ->
+        print_completion(result)
+
+      {:disabled, reason} ->
+        IO.puts(:stderr, "LSP disabled: #{reason}")
+
+      {:error, message} ->
+        IO.puts(:stderr, color(:red, "completion failed: #{message}"))
+    end
+  end
+
+  defp print_diagnostics({:disabled, reason}) do
+    IO.puts("LSP disabled: #{reason}")
+  end
+
+  defp print_diagnostics([]), do: IO.puts("(no diagnostics)")
+
+  defp print_diagnostics(diagnostics) when is_list(diagnostics) do
+    Enum.each(diagnostics, fn diagnostic ->
+      range = Map.get(diagnostic, "range", %{})
+      start = Map.get(range, "start", %{})
+      line = Map.get(start, "line", 0) + 1
+      character = Map.get(start, "character", 0) + 1
+      severity = Map.get(diagnostic, "severity", "?")
+      message = Map.get(diagnostic, "message", inspect(diagnostic))
+
+      IO.puts("#{line}:#{character} [#{severity}] #{message}")
+    end)
+  end
+
+  defp print_diagnostics(diagnostics) when is_map(diagnostics) do
+    diagnostics
+    |> Enum.flat_map(fn {_uri, items} -> items end)
+    |> print_diagnostics()
+  end
+
+  defp print_completion(%{"items" => items}) when is_list(items),
+    do: print_completion_items(items)
+
+  defp print_completion(items) when is_list(items), do: print_completion_items(items)
+  defp print_completion(_result), do: IO.puts("(no completions)")
+
+  defp print_completion_items([]), do: IO.puts("(no completions)")
+
+  defp print_completion_items(items) do
+    items
+    |> Enum.take(20)
+    |> Enum.each(fn item ->
+      label = Map.get(item, "label", inspect(item))
+      detail = Map.get(item, "detail")
+
+      if detail do
+        IO.puts("#{label}\t#{detail}")
+      else
+        IO.puts(label)
+      end
+    end)
   end
 
   defp repl_help do
@@ -691,10 +943,17 @@ defmodule Elv.CLI do
       :help                  show this help
       :quit                  exit
       :reset                 restart the V session
+      :recover               restore the latest source-level checkpoint
+      :crashes               show crash and timeout counters
       :version               print V version
       :vpath                 show the active V executable
       :doctor                show session diagnostics
+      :capabilities          show current backend capability flags
+      :snapshots             show checkpoint and replay-plan details
+      :diagnostics           show latest LSP diagnostics when --lsp is enabled
+      :complete <source>     ask LSP for completions at the end of source
       :history               show submitted V forms
+      :search <query>        search submitted V forms
       :load <file.v>         load a V snippet into the current session
       :run <file.v> [args]   run a V file outside the session
       :check <file.v>        compile-check a V file
@@ -761,7 +1020,7 @@ defmodule Elv.CLI do
   defp repl_usage do
     """
     Usage:
-      elv repl [--v PATH] [--cwd DIR] [--timeout MS] [--tmp-root DIR]
+      elv repl [--v PATH] [--cwd DIR] [--timeout MS] [--tmp-root DIR] [--snapshot-root DIR] [--backend replay|worker|live|plugin] [--worker-recycle-after N] [--hot-generation-retention N] [--hot-recycle-after-generations N] [--lsp] [--lsp-command PATH] [--no-snapshots]
 
     V lookup order:
       1. --v / --v-path
@@ -782,6 +1041,40 @@ defmodule Elv.CLI do
     """
   end
 
+  defp ensure_started do
+    case Application.ensure_all_started(:elv) do
+      {:ok, _apps} -> :ok
+      {:error, {:already_started, _app}} -> :ok
+      {:error, {:elv, {:already_started, _pid}}} -> :ok
+      {:error, reason} -> fail("Could not start #{Elv.short_name()}: #{inspect(reason)}", 1)
+    end
+  end
+
+  defp session_metadata(session), do: SessionServer.metadata(session)
+
+  defp format_snapshots(%{snapshots: :disabled}), do: "disabled"
+
+  defp format_snapshots(%{snapshots: :enabled, snapshot_root: root}) when is_binary(root),
+    do: root
+
+  defp format_snapshots(%{snapshot_root: root}) when is_binary(root), do: root
+  defp format_snapshots(_metadata), do: "unknown"
+
+  defp format_lsp(%{lsp: :enabled, lsp_command: command}), do: "enabled #{command}"
+  defp format_lsp(%{lsp: :disabled, lsp_last_error: reason}), do: "disabled #{reason}"
+  defp format_lsp(%{lsp: other}), do: inspect(other)
+  defp format_lsp(_metadata), do: "unknown"
+
+  defp format_capabilities(capabilities) do
+    capabilities
+    |> Enum.sort_by(fn {name, _enabled?} -> Atom.to_string(name) end)
+    |> Enum.map(fn {name, enabled?} -> "#{name}=#{enabled?}" end)
+    |> Enum.join(" ")
+  end
+
+  defp format_optional_time(nil), do: "(none)"
+  defp format_optional_time(us), do: format_time(us)
+
   defp normalize_cwd(nil), do: {:ok, File.cwd!()}
 
   defp normalize_cwd(path) do
@@ -793,6 +1086,19 @@ defmodule Elv.CLI do
       {:error, "Working directory does not exist: #{path}"}
     end
   end
+
+  defp normalize_backend(nil), do: {:ok, Elv.Engine}
+  defp normalize_backend(""), do: {:ok, Elv.Engine}
+  defp normalize_backend("replay"), do: {:ok, Elv.Engine}
+  defp normalize_backend("worker"), do: {:ok, Elv.WorkerBackend}
+  defp normalize_backend("live"), do: {:ok, Elv.HotReloadBackend}
+  defp normalize_backend("plugin"), do: {:ok, Elv.HotReloadBackend}
+
+  defp normalize_backend(other),
+    do: {:error, "Unknown backend: #{other}; expected replay, worker, live, or plugin"}
+
+  defp hot_reload_mode("plugin"), do: :plugin
+  defp hot_reload_mode(_backend_name), do: :live
 
   defp split_command(command) do
     parts = String.split(command, ~r/\s+/, trim: true)
@@ -826,6 +1132,15 @@ defmodule Elv.CLI do
     |> Enum.each(fn {item, index} ->
       item = String.replace(item, "\n", "\n      ")
       IO.puts("#{String.pad_leading(Integer.to_string(index), 4)}  #{item}")
+    end)
+  end
+
+  defp print_search([]), do: IO.puts("(no matches)")
+
+  defp print_search(matches) do
+    Enum.each(matches, fn %{index: index, source: source} ->
+      source = String.replace(source, "\n", "\n      ")
+      IO.puts("#{String.pad_leading(Integer.to_string(index), 4)}  #{source}")
     end)
   end
 
